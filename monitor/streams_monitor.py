@@ -12,7 +12,7 @@ import pygame
 import math
 
 # --- Configuration des logs ---
-logger = logging.getLogger("StreamsVisualizer")
+logger = logging.getLogger("StreamsMonitor")
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
 handler.setFormatter(logging.Formatter("[%(levelname)s] %(asctime)s - %(message)s"))
@@ -165,10 +165,10 @@ class CollapsibleGroup:
                 self.y <= py <= self.y + 30)  # Seulement la zone du titre est cliquable
 
 # ============================================================================
-# Main Visualizer (Pygame Edition)
+# Main Monitor (Pygame Edition)
 # ============================================================================
 
-class StreamsVisualizer:
+class StreamsMonitor:
     def __init__(self, config_filepath):
         pygame.init()
         
@@ -184,15 +184,15 @@ class StreamsVisualizer:
         # Zenoh Init
         self.zenoh_session = self._setup_zenoh()
         
+        # Pygame Setup - Taille initiale 800x600
+        self.screen = pygame.display.set_mode((800, 600), pygame.RESIZABLE)
+        pygame.display.set_caption("SAS - Stream Monitor")
+        
         # Streams & Groups
         self.streams = {}
         self.groups = []
         self._setup_subscribers()
         self._setup_groups()
-        
-        # Pygame Setup - Taille initiale 800x600
-        self.screen = pygame.display.set_mode((800, 600), pygame.RESIZABLE)
-        pygame.display.set_caption("LIFE 2025 - Écho du Vide")
         
         # Polices
         self.font_main = pygame.font.SysFont("Monospace", 16, bold=True)
@@ -206,7 +206,7 @@ class StreamsVisualizer:
         self.scroll_offset = 0
         self.max_scroll = 0
         
-        logger.info(f"StreamsVisualizer initialized with {self.target_fps} FPS target")
+        logger.info(f"StreamsMonitor initialized with {self.target_fps} FPS target")
 
     def _setup_signal_handlers(self):
         def signal_handler(sig, frame):
@@ -294,7 +294,7 @@ class StreamsVisualizer:
             self.last_stats_time = now
         
         # Header
-        header_text = f"🧠 STREAMS VISUALIZER - {self.window_duration}s | FPS: {getattr(self, 'fps', 0)}/{self.target_fps}"
+        header_text = f"🧠 STREAMS Monitor - {self.window_duration}s | FPS: {getattr(self, 'fps', 0)}/{self.target_fps}"
         header_surf = self.font_main.render(header_text, True, (0, 255, 255))
         self.screen.blit(header_surf, (win_w//2 - header_surf.get_width()//2, 15))
         
@@ -532,14 +532,19 @@ class StreamsVisualizer:
         logger.info("Pygame closed")
 
 if __name__ == "__main__":
-    config_path = sys.argv[1] if len(sys.argv) > 1 else "streams_config.json"
+    config_file = sys.argv[1] if len(sys.argv) > 1 else "streams_config.json"
     
     try:
-        logger.info(f"Starting StreamsVisualizer with config: {config_path}")
-        viz = StreamsVisualizer(config_path)
+        script_dir = os.path.dirname(os.path.abspath(__file__)) 
+        logger.info(f"StreamsMonitor dir : {script_dir}")
+
+        config_filepath = os.path.join(script_dir, config_file)
+
+        logger.info(f"Starting StreamsMonitor with config: {config_filepath}")
+        viz = StreamsMonitor(config_filepath)
         viz.run()
     except FileNotFoundError:
-        logger.error(f"Configuration file not found: {config_path}")
+        logger.error(f"Configuration file not found: {config_filepath}")
         sys.exit(1)
     except json.JSONDecodeError as e:
         logger.error(f"Invalid JSON in configuration file: {e}")
