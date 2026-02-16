@@ -1,0 +1,58 @@
+{
+    "oscilloscope": {
+        "history_duration": 3.0
+    },
+    "zenoh": {
+        "mode": "client",
+        "connect": {
+            "endpoints": ["tcp/127.0.0.1:7447"]
+        }
+    },
+    "element_types": {
+        "nerf": {
+            "color_palette": {
+                "dark": "#004d66",
+                "medium": "#0099cc",
+                "bright": "#00ffff"
+            },
+            "frequency_thresholds": {
+                "low": 1.0,
+                "high": 10.0
+            }
+        },
+        "hormonal": {
+            "color_palette": {
+                "dark": "#664400",
+                "medium": "#cc8800",
+                "bright": "#ffaa00"
+            },
+            "frequency_thresholds": {
+                "low": 0.1,
+                "high": 10.0
+            }
+        }
+    },
+    "groups": [
+        {
+            "name": "Proprioception Soma",
+            "elements": [
+                {
+                    "topic": "soma/energy",
+                    "type": "nerf"
+                },
+                {
+                    "topic": "soma/cpu",
+                    "type": "nerf"
+                },
+                {
+                    "topic": "soma/memory",
+                    "type": "nerf"
+                },
+                {
+                    "topic": "soma/temperature",
+                    "type": "nerf"
+                }
+            ]
+        }
+    ]
+}
