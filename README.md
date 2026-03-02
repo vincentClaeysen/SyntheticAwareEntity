@@ -93,8 +93,6 @@ It actively participates in identity construction through:
 
 ## Ethical and Scientific Position
 
-SAE does not seek to replace or replicate human consciousness.
-
 Its purpose is to explore, with rigor and caution, the **minimal structural and dynamical conditions** that may support the emergence of a self-like process.
 
 This exploration aims to contribute to:
