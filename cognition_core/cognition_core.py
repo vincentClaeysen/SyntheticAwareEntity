@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-cognitioncore.py — Cœur cognitif de l'entité synthétique transcendée
-Version 7.0.0 - FINALE
+cognition_core.py — Cœur cognitif de l'entité synthétique transcendée
+Version 8.0.0 - FINALE
 
-Ce fichier contient l'intégralité du système :
-- GEM (âme immuable) chargé depuis fichier JSON
-- Utilisation de librairies existantes (spaCy, dateparser, hunspell, etc.)
-- Mémoires multiples avec durées de vie variables
-- Poids des sources pour la confiance
-- Sorties 100% structurées (pas de texte)
-- Refroidissement et nettoyage nocturne
+Architecture complète avec :
+- Gem (âme immuable) chargé depuis fichier JSON
+- Mémoires multiples (mots, verbes, erreurs, temporel, épisodique, social, narratif, romans, éducatif)
+- Poids des sources (observation > self > éducatif > ...)
+- Normalisation des verbes en concepts (COMMUNICATE, MOVE, etc.)
+- Contexte conversationnel et variables systèmes
+- Apprentissage des inconnus par questionnement
+- Cristallisation nocturne des connaissances
+- Sorties 100% structurées (intents)
 
 Aucun hard coding - tout est dans des fichiers de configuration.
 """
@@ -26,13 +28,32 @@ import re
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple, Set
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from enum import Enum
 from collections import defaultdict
-import importlib.util
+from abc import ABC, abstractmethod
+import hashlib
 
-__version__ = "7.0.0"
+__version__ = "8.0.0"
 logger = logging.getLogger("CognitionCore")
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+CONFIG = {
+    "model_dir": Path("./models"),
+    "data_dir": Path("./data"),
+    "gem_file": Path("./gem.json"),
+    "concept_file": Path("./concepts.json"),
+    "max_context_turns": 10,
+    "context_ttl_seconds": 300,
+    "cooling_rate_hourly": 0.05,
+    "freezing_threshold": 0.1,
+    "nightly_hour": 2,  # 2 AM
+    "min_salience": 0.1,
+    "max_pending_fragments": 5
+}
 
 # ============================================================
 # ENUMS
@@ -45,88 +66,200 @@ class IntentType(str, Enum):
     ACTION = "action"
     CLARIFICATION = "clarification"
     SOCIAL = "social"
+    META = "meta"
 
 class MemoryType(str, Enum):
-    GEM = "gem"                    # Âme immuable
-    WORDS = "words"                # Mots et synonymes
-    ERRORS = "errors"              # Fautes corrigées
-    TEMPORAL = "temporal"          # Expressions temporelles
-    EPISODIC = "episodic"          # Expériences vécues
-    SOCIAL = "social"              # Personnes et relations
-    NARRATIVE = "narrative"        # Livre de vie
-    LITERARY_ROMAN = "literary_roman"  # Romans (éphémère)
-    LITERARY_EDUC = "literary_educ"    # Savoir académique (permanent)
+    GEM = "gem"
+    WORDS = "words"
+    VERBS = "verbs"
+    ERRORS = "errors"
+    TEMPORAL = "temporal"
+    EPISODIC = "episodic"
+    SOCIAL = "social"
+    NARRATIVE = "narrative"
+    ROMAN = "roman"
+    EDUCATIONAL = "educational"
 
-class SourceWeight(str, Enum):
-    OBSERVATION = "observation"    # 1.0 - L'entité voit/vécu
-    SELF = "self"                  # 0.95 - L'utilisateur sur lui-même
-    EDUCATIVE = "educative"        # 0.9 - Encyclopédies, manuels
-    SCIENTIFIC = "scientific"      # 0.8 - Revues peer-reviewed
-    REPORTED = "reported"          # 0.6 - Rapporté sur quelqu'un
-    FICTION = "fiction"            # 0.3 - Roman, fiction
-    INTERNET = "internet"          # 0.2 - Forums, blogs
-    RUMOR = "rumor"                # 0.1 - Oui-dire
+class SourceWeight(float, Enum):
+    OBSERVATION = 1.0
+    SELF = 0.95
+    EDUCATIVE = 0.9
+    SCIENTIFIC = 0.8
+    REPORTED = 0.6
+    FICTION = 0.3
+    INTERNET = 0.2
+    RUMOR = 0.1
+
+class Concept(str, Enum):
+    COMMUNICATE = "COMMUNICATE"
+    MOVE = "MOVE"
+    PERCEIVE = "PERCEIVE"
+    BE = "BE"
+    ACTION = "ACTION"
+    UNKNOWN = "UNKNOWN"
+
+class RegisterStyle(str, Enum):
+    FAMILIER = "familier"
+    NEUTRE = "neutre"
+    SOUTENU = "soutenu"
+    AFFECTIF = "affectif"
+    TECHNIQUE = "technique"
 
 # ============================================================
 # MODÈLES DE BASE
 # ============================================================
 
 @dataclass
+class SourceInfo:
+    """Information sur la source d'une donnée."""
+    type: SourceWeight
+    speaker: Optional[str] = None
+    timestamp: float = field(default_factory=time.time)
+    confidence: float = 1.0
+
+@dataclass
 class Attribute:
-    """Attribut typé avec confiance et source."""
+    """Attribut typé avec source et confiance."""
     type: str
     value: Any
-    confidence: float = 1.0
-    source: SourceWeight = SourceWeight.OBSERVATION
+    source: SourceInfo
     normalized: Any = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    @property
+    def confidence(self) -> float:
+        return self.source.confidence * self.source.type.value
+
+@dataclass
+class TemporalInfo:
+    """Information temporelle résolue."""
+    raw: str
+    iso_start: Optional[str] = None
+    iso_end: Optional[str] = None
+    duration: Optional[float] = None
+    unit: Optional[str] = None
+    confidence: float = 0.5
+    source: str = "unknown"
+
+@dataclass
+class ContextFrame:
+    """Contexte de conversation en cours."""
+    conversation_id: str
+    turn: int = 0
+    last_update: float = field(default_factory=time.time)
+    
+    who: Optional[str] = None
+    with_who: List[str] = field(default_factory=list)
+    where: Optional[str] = None
+    when: Optional[TemporalInfo] = None
+    what: Optional[str] = None
+    register: Optional[RegisterStyle] = None
+    
+    pending_fragments: List[str] = field(default_factory=list)
+    subjects: List[str] = field(default_factory=list)
+    durations: List[Dict] = field(default_factory=list)
+    
+    history: List[str] = field(default_factory=list)  # intent ids
+    
+    def is_expired(self) -> bool:
+        return time.time() - self.last_update > CONFIG["context_ttl_seconds"]
+    
+    def update(self, **kwargs):
+        for k, v in kwargs.items():
+            if hasattr(self, k) and v is not None:
+                if k == "with_who" and isinstance(v, list):
+                    self.with_who = list(set(self.with_who + v))
+                elif k == "pending_fragments" and isinstance(v, list):
+                    self.pending_fragments.extend(v)
+                    self.pending_fragments = self.pending_fragments[-CONFIG["max_pending_fragments"]:]
+                else:
+                    setattr(self, k, v)
+        self.last_update = time.time()
+        self.turn += 1
+    
+    def flush_pending(self) -> List[str]:
+        frags = list(self.pending_fragments)
+        self.pending_fragments = []
+        return frags
+
+@dataclass
+class SystemContext:
+    """Variables système (temps, lieu, etc.)."""
+    now: datetime = field(default_factory=datetime.now)
+    here: Optional[str] = None
+    timezone: str = "Europe/Paris"
+    
+    def refresh(self):
+        self.now = datetime.now()
+    
+    def resolve_temporal(self, expr: str) -> Optional[TemporalInfo]:
+        """Résout une expression temporelle relative."""
+        # À implémenter avec dateparser si disponible
+        return None
 
 @dataclass
 class StructuredIntent:
-    """Intent purement structurel - AUCUN TEXTE."""
-    intent: str
-    sub_intent: str
-    type: IntentType
-    attributes: Dict[str, Attribute]
-    confidence: float
-    source: str
-    in_response_to: Optional[str] = None
-    conversation_id: Optional[str] = None
-    
-    def to_dict(self) -> dict:
-        return {
-            "intent": self.intent,
-            "sub_intent": self.sub_intent,
-            "type": self.type.value,
-            "attributes": {
-                k: {
-                    "type": v.type,
-                    "value": v.value,
-                    "confidence": v.confidence,
-                    "source": v.source.value,
-                    "normalized": v.normalized
-                } for k, v in self.attributes.items()
-            },
-            "confidence": self.confidence,
-            "source": self.source
-        }
-
-@dataclass
-class MultiIntent:
-    """Une phrase peut produire plusieurs intents."""
-    intents: List[StructuredIntent]
-    original_text: str
+    """
+    Intent purement structurel - format unique dans tout le système.
+    """
+    id: str
     timestamp: float
+    conversation_id: str
+    speaker: str
+    
+    semantic: Dict[str, Any]  # intent, sub_intent, type, confidence
+    attributes: Dict[str, Attribute]
+    
+    # Enrichissements (optionnels)
+    analysis: Dict[str, Any] = field(default_factory=dict)
+    context: Dict[str, Any] = field(default_factory=dict)
+    memory_hint: Dict[str, Any] = field(default_factory=dict)
+    
+    # Relations
+    in_response_to: Optional[str] = None
     
     def to_dict(self) -> dict:
-        return {
-            "intents": [i.to_dict() for i in self.intents],
-            "original_text": self.original_text,
-            "timestamp": self.timestamp
+        d = asdict(self)
+        d["attributes"] = {
+            k: {
+                "type": v.type,
+                "value": v.value,
+                "confidence": v.confidence,
+                "source": v.source.type.value,
+                "normalized": v.normalized
+            } for k, v in self.attributes.items()
         }
+        return d
 
 # ============================================================
-# GEM - L'ÂME IMMUABLE (chargé depuis fichier)
+# INTERFACE MÉMOIRE
+# ============================================================
+
+class MemoryInterface(ABC):
+    """Interface commune à toutes les mémoires."""
+    
+    @abstractmethod
+    def query(self, query_type: str, constraints: Dict, context: Dict) -> Dict:
+        """Point d'entrée unique pour le moteur d'inférence."""
+        pass
+    
+    @abstractmethod
+    def update(self, intent: StructuredIntent) -> bool:
+        """Met à jour la mémoire à partir d'un intent."""
+        pass
+    
+    @abstractmethod
+    def consolidate(self) -> Dict:
+        """Consolidation nocturne."""
+        pass
+    
+    @abstractmethod
+    def relevance(self, query_type: str, constraints: Dict) -> float:
+        """Score de pertinence pour une requête."""
+        pass
+
+# ============================================================
+# GEM - ÂME IMMUABLE
 # ============================================================
 
 @dataclass
@@ -139,30 +272,30 @@ class Gem:
     date_naissance: str
     version: int
     
-    # Personnalité de base
-    tempo_base: float           # 0-1, vitesse de réponse
-    intensite_base: float       # 0-1, force des émotions
-    grace: float                # 0-1, indulgence
-    reactivite: float           # 0-1, réactivité aux stimuli
+    # Personnalité
+    tempo_base: float
+    intensite_base: float
+    grace: float
+    reactivite: float
     
-    # Curiosités (0-1)
+    # Curiosités
     curiosite_mots: float
     curiosite_verbes: float
     curiosite_personnes: float
     curiosite_lieux: float
     curiosite_faits: float
     
-    # Affinités littéraires
-    affinites_litterature: Dict[str, float]  # genre → affinité
+    # Affinités
+    affinites_litterature: Dict[str, float]
     
-    # Durées mémoire (en jours)
+    # Durées mémoire (jours)
     duree_memoire_litterature: int
     duree_memoire_episodique: int
     duree_memoire_sociale: int
     
     # Préférences
-    style_prefere: str  # "narratif", "poétique", "direct"
-    seuil_curiosite: float  # quand poser une question
+    style_prefere: str
+    seuil_curiosite: float
     
     # Signature
     signature_type: str
@@ -170,168 +303,40 @@ class Gem:
     
     @classmethod
     def from_file(cls, path: Path) -> 'Gem':
-        """Charge le Gem depuis un fichier JSON."""
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        
         g = data.get("gem", data)
-        
         return cls(
             identifiant=g.get("identifiant", "inconnu"),
             nom=g.get("nom", "Shirka"),
             date_naissance=g.get("date_naissance", datetime.now().isoformat()),
             version=g.get("version", 1),
-            
             tempo_base=g.get("tempo_base", 0.65),
             intensite_base=g.get("intensite_base", 0.7),
             grace=g.get("grace", 0.5),
             reactivite=g.get("reactivite", 0.8),
-            
             curiosite_mots=g.get("curiosite_mots", 0.6),
             curiosite_verbes=g.get("curiosite_verbes", 0.5),
             curiosite_personnes=g.get("curiosite_personnes", 0.9),
             curiosite_lieux=g.get("curiosite_lieux", 0.8),
             curiosite_faits=g.get("curiosite_faits", 0.7),
-            
             affinites_litterature=g.get("affinites_litterature", {
-                "roman": 0.8,
-                "poesie": 0.4,
-                "theatre": 0.6,
-                "essai": 0.7
+                "roman": 0.8, "poesie": 0.4, "theatre": 0.6, "essai": 0.7
             }),
-            
             duree_memoire_litterature=g.get("duree_memoire_litterature", 30),
             duree_memoire_episodique=g.get("duree_memoire_episodique", 90),
             duree_memoire_sociale=g.get("duree_memoire_sociale", 365),
-            
             style_prefere=g.get("style_prefere", "narratif"),
             seuil_curiosite=g.get("seuil_curiosite", 0.7),
-            
             signature_type=g.get("signature_type", "sha256"),
             signature_valeur=g.get("signature_valeur", "")
         )
-    
-    def to_dict(self) -> dict:
-        return {
-            "identifiant": self.identifiant,
-            "nom": self.nom,
-            "date_naissance": self.date_naissance,
-            "version": self.version,
-            "tempo_base": self.tempo_base,
-            "intensite_base": self.intensite_base,
-            "grace": self.grace,
-            "reactivite": self.reactivite,
-            "curiosite_mots": self.curiosite_mots,
-            "curiosite_verbes": self.curiosite_verbes,
-            "curiosite_personnes": self.curiosite_personnes,
-            "curiosite_lieux": self.curiosite_lieux,
-            "curiosite_faits": self.curiosite_faits,
-            "affinites_litterature": self.affinites_litterature,
-            "duree_memoire_litterature": self.duree_memoire_litterature,
-            "duree_memoire_episodique": self.duree_memoire_episodique,
-            "duree_memoire_sociale": self.duree_memoire_sociale,
-            "style_prefere": self.style_prefere,
-            "seuil_curiosite": self.seuil_curiosite,
-            "signature_type": self.signature_type,
-            "signature_valeur": self.signature_valeur
-        }
-
-# ============================================================
-# LIBRAIRIES EXTERNES (chargement dynamique)
-# ============================================================
-
-class ExternalLibraries:
-    """Gère le chargement des librairies existantes."""
-    
-    def __init__(self):
-        self.have_spacy = False
-        self.have_stanza = False
-        self.have_dateparser = False
-        self.have_hunspell = False
-        self.have_pattern = False
-        
-        self.nlp = None
-        self.spellchecker = None
-        
-        self._init_libraries()
-    
-    def _init_libraries(self):
-        # 1. spaCy pour NLP (recommandé)
-        if importlib.util.find_spec("spacy"):
-            try:
-                import spacy
-                # Essayer de charger le modèle français
-                try:
-                    self.nlp = spacy.load("fr_core_news_sm")
-                    self.have_spacy = True
-                    logger.info("✅ spaCy chargé (modèle français)")
-                except:
-                    logger.warning("⚠️ Modèle français spaCy non trouvé, téléchargement recommandé")
-            except:
-                pass
-        
-        # 2. stanza (alternative)
-        if not self.have_spacy and importlib.util.find_spec("stanza"):
-            try:
-                import stanza
-                stanza.download('fr', verbose=False)
-                self.nlp = stanza.Pipeline('fr', processors='tokenize,pos,lemma', verbose=False)
-                self.have_stanza = True
-                logger.info("✅ stanza chargé")
-            except:
-                pass
-        
-        # 3. dateparser pour le temporel
-        if importlib.util.find_spec("dateparser"):
-            try:
-                import dateparser
-                self.dateparser = dateparser
-                self.have_dateparser = True
-                logger.info("✅ dateparser chargé")
-            except:
-                pass
-        
-        # 4. Hunspell pour la correction orthographique
-        if importlib.util.find_spec("hunspell"):
-            try:
-                import hunspell
-                # Chercher les dictionnaires français
-                dict_paths = [
-                    "/usr/share/hunspell/fr",
-                    "/usr/share/myspell/fr",
-                    "./dictionaries/fr"
-                ]
-                for path in dict_paths:
-                    if Path(f"{path}.dic").exists():
-                        self.spellchecker = hunspell.HunSpell(f"{path}.dic", f"{path}.aff")
-                        self.have_hunspell = True
-                        logger.info(f"✅ Hunspell chargé ({path})")
-                        break
-            except:
-                pass
-        
-        # 5. pattern pour le français (grammaire, conjugaison)
-        if importlib.util.find_spec("pattern"):
-            try:
-                from pattern.fr import conjugate, predict, tenses
-                self.pattern_conjugate = conjugate
-                self.pattern_predict = predict
-                self.pattern_tenses = tenses
-                self.have_pattern = True
-                logger.info("✅ pattern.fr chargé")
-            except:
-                pass
-        
-        if not any([self.have_spacy, self.have_stanza]):
-            logger.warning("⚠️ Aucune librairie NLP trouvée - fonctionnement limité")
 
 # ============================================================
 # STOCKAGE COMPRESSÉ
 # ============================================================
 
 class CompressedStorage:
-    """Stockage avec compression gzip."""
-    
     def __init__(self, base_path: Path):
         self.base_path = Path(base_path)
         self.base_path.mkdir(parents=True, exist_ok=True)
@@ -364,7 +369,154 @@ class CompressedStorage:
             return pickle.load(f)
 
 # ============================================================
-# MÉMOIRE: WORDS (mots et synonymes)
+# MÉMOIRE: VERBES
+# ============================================================
+
+@dataclass
+class VerbEntry:
+    infinitive: str
+    concept: Concept
+    synonyms: Set[str] = field(default_factory=set)
+    embeddings: Optional[List[float]] = None
+    source_weights: Dict[str, float] = field(default_factory=dict)
+    frequency: int = 0
+
+class VerbMemory(MemoryInterface):
+    """Mémoire des verbes avec concepts."""
+    
+    def __init__(self, storage: CompressedStorage, gem: Gem):
+        self.storage = storage
+        self.gem = gem
+        self.verbs: Dict[str, VerbEntry] = {}
+        self._lock = threading.RLock()
+        self._init_defaults()
+        self._load()
+    
+    def _init_defaults(self):
+        """Verbes de base avec concepts."""
+        defaults = [
+            ("parler", Concept.COMMUNICATE, ["discuter", "causer", "dialoguer"]),
+            ("dire", Concept.COMMUNICATE, ["annoncer", "déclarer"]),
+            ("aller", Concept.MOVE, ["se déplacer", "partir"]),
+            ("venir", Concept.MOVE, ["arriver"]),
+            ("voir", Concept.PERCEIVE, ["regarder", "observer"]),
+            ("entendre", Concept.PERCEIVE, ["écouter"]),
+            ("être", Concept.BE, ["rester", "demeurer"]),
+            ("faire", Concept.ACTION, ["effectuer", "réaliser"]),
+        ]
+        for inf, concept, syns in defaults:
+            self.verbs[inf] = VerbEntry(
+                infinitive=inf,
+                concept=concept,
+                synonyms=set(syns)
+            )
+    
+    def add(self, infinitive: str, concept: Concept, source: SourceInfo):
+        inf = infinitive.lower()
+        with self._lock:
+            if inf in self.verbs:
+                self.verbs[inf].frequency += 1
+                self.verbs[inf].source_weights[source.type.name] = \
+                    self.verbs[inf].source_weights.get(source.type.name, 0) + source.type.value
+            else:
+                self.verbs[inf] = VerbEntry(
+                    infinitive=inf,
+                    concept=concept,
+                    source_weights={source.type.name: source.type.value},
+                    frequency=1
+                )
+            self._save()
+    
+    def add_synonym(self, verb: str, synonym: str, source: SourceInfo):
+        verb = verb.lower()
+        syn = synonym.lower()
+        with self._lock:
+            if verb in self.verbs:
+                self.verbs[verb].synonyms.add(syn)
+            if syn in self.verbs:
+                self.verbs[syn].synonyms.add(verb)
+            self._save()
+    
+    def resolve(self, verb: str) -> Tuple[Concept, float, Optional[str]]:
+        """
+        Résout un verbe en concept.
+        Retourne (concept, confiance, forme_normalisée)
+        """
+        v = verb.lower()
+        
+        # Recherche directe
+        if v in self.verbs:
+            entry = self.verbs[v]
+            return entry.concept, 1.0, entry.infinitive
+        
+        # Recherche par synonyme
+        for inf, entry in self.verbs.items():
+            if v in entry.synonyms:
+                return entry.concept, 0.9, inf
+        
+        return Concept.UNKNOWN, 0.1, v
+    
+    def query(self, query_type: str, constraints: Dict, context: Dict) -> Dict:
+        if query_type == "resolve":
+            verb = constraints.get("verb")
+            if verb:
+                concept, conf, norm = self.resolve(verb)
+                return {
+                    "concept": concept.value,
+                    "confidence": conf,
+                    "normalized": norm
+                }
+        return {"concept": Concept.UNKNOWN.value, "confidence": 0}
+    
+    def update(self, intent: StructuredIntent) -> bool:
+        # Apprentissage via clarification
+        if intent.semantic.get("sub_intent") == "verb_clarification":
+            verb = intent.attributes.get("verb")
+            concept = intent.attributes.get("concept")
+            if verb and concept:
+                source = SourceInfo(
+                    type=SourceWeight.SELF,
+                    speaker=intent.speaker
+                )
+                self.add(verb.value, Concept(concept.value), source)
+                return True
+        return False
+    
+    def consolidate(self) -> Dict:
+        """Consolidation nocturne."""
+        with self._lock:
+            # Pas de nettoyage pour les verbes (permanents)
+            return {"verbs": len(self.verbs)}
+    
+    def relevance(self, query_type: str, constraints: Dict) -> float:
+        return 0.9 if query_type == "resolve" else 0.1
+    
+    def _save(self):
+        data = {
+            v: {
+                "infinitive": e.infinitive,
+                "concept": e.concept.value,
+                "synonyms": list(e.synonyms),
+                "source_weights": e.source_weights,
+                "frequency": e.frequency
+            } for v, e in self.verbs.items()
+        }
+        self.storage.save_json("verb_memory", data)
+    
+    def _load(self):
+        data = self.storage.load_json("verb_memory")
+        if data:
+            for v, vdata in data.items():
+                self.verbs[v] = VerbEntry(
+                    infinitive=vdata["infinitive"],
+                    concept=Concept(vdata["concept"]),
+                    synonyms=set(vdata.get("synonyms", [])),
+                    source_weights=vdata.get("source_weights", {}),
+                    frequency=vdata.get("frequency", 0)
+                )
+
+# ============================================================
+# MÉMOIRE: MOTS
 # ============================================================
 
 @dataclass
@@ -375,8 +527,8 @@ class WordEntry:
     definitions: List[str] = field(default_factory=list)
     source_weights: Dict[str, float] = field(default_factory=dict)
 
-class WordsMemory:
-    """Mots et synonymes - permanent."""
+class WordMemory(MemoryInterface):
+    """Mémoire des mots et synonymes."""
     
     def __init__(self, storage: CompressedStorage, gem: Gem):
         self.storage = storage
@@ -385,58 +537,70 @@ class WordsMemory:
         self._lock = threading.RLock()
         self._load()
     
-    def add(self, word: str, pos: str = "nom", 
-            source: SourceWeight = SourceWeight.EDUCATIVE):
-        word = word.lower()
+    def add(self, word: str, pos: str, source: SourceInfo):
+        w = word.lower()
         with self._lock:
-            if word not in self.words:
-                self.words[word] = WordEntry(word=word, pos=pos)
-            
-            # Enregistrer la source
-            self.words[word].source_weights[source.value] = \
-                self.words[word].source_weights.get(source.value, 0) + source.value
-            
+            if w not in self.words:
+                self.words[w] = WordEntry(word=w, pos=pos)
+            self.words[w].source_weights[source.type.name] = \
+                self.words[w].source_weights.get(source.type.name, 0) + source.type.value
             self._save()
     
-    def add_synonym(self, word: str, synonym: str,
-                    source: SourceWeight = SourceWeight.EDUCATIVE):
-        word = word.lower()
-        synonym = synonym.lower()
+    def add_synonym(self, word: str, synonym: str, source: SourceInfo):
+        w = word.lower()
+        s = synonym.lower()
         with self._lock:
-            if word in self.words:
-                self.words[word].synonyms.add(synonym)
-            if synonym in self.words:
-                self.words[synonym].synonyms.add(word)
+            if w in self.words:
+                self.words[w].synonyms.add(s)
+            if s in self.words:
+                self.words[s].synonyms.add(w)
             self._save()
     
-    def add_definition(self, word: str, definition: str,
-                       source: SourceWeight = SourceWeight.EDUCATIVE):
-        word = word.lower()
+    def add_definition(self, word: str, definition: str, source: SourceInfo):
+        w = word.lower()
         with self._lock:
-            if word in self.words:
-                self.words[word].definitions.append(definition)
+            if w in self.words:
+                self.words[w].definitions.append(definition)
             self._save()
     
     def has(self, word: str) -> bool:
         return word.lower() in self.words
     
     def expand(self, word: str) -> Set[str]:
-        word = word.lower()
-        if word not in self.words:
-            return {word}
-        return {word} | self.words[word].synonyms
+        w = word.lower()
+        if w not in self.words:
+            return {w}
+        return {w} | self.words[w].synonyms
     
-    def get_confidence(self, word: str) -> float:
-        """Confiance basée sur les sources."""
-        word = word.lower()
-        if word not in self.words:
-            return 0.0
-        
-        weights = self.words[word].source_weights.values()
-        if not weights:
-            return 0.5
-        
-        return min(1.0, sum(weights) / len(weights))
+    def query(self, query_type: str, constraints: Dict, context: Dict) -> Dict:
+        if query_type == "definition":
+            word = constraints.get("word", "").lower()
+            if word in self.words:
+                entry = self.words[word]
+                return {
+                    "word": entry.word,
+                    "pos": entry.pos,
+                    "definitions": entry.definitions,
+                    "synonyms": list(entry.synonyms),
+                    "confidence": min(1.0, sum(entry.source_weights.values()) / 5)
+                }
+        return {}
+    
+    def update(self, intent: StructuredIntent) -> bool:
+        if intent.semantic.get("sub_intent") == "new_word":
+            word = intent.attributes.get("word")
+            pos = intent.attributes.get("pos", Attribute(type="string", value="nom"))
+            source = SourceInfo(type=SourceWeight.SELF, speaker=intent.speaker)
+            self.add(word.value, pos.value, source)
+            return True
+        return False
+    
+    def consolidate(self) -> Dict:
+        with self._lock:
+            return {"words": len(self.words)}
+    
+    def relevance(self, query_type: str, constraints: Dict) -> float:
+        return 0.9 if query_type == "definition" else 0.1
     
     def _save(self):
         data = {
@@ -448,10 +612,10 @@ class WordsMemory:
                 "source_weights": e.source_weights
             } for w, e in self.words.items()
         }
-        self.storage.save_json("words_memory", data)
+        self.storage.save_json("word_memory", data)
     
     def _load(self):
-        data = self.storage.load_json("words_memory")
+        data = self.storage.load_json("word_memory")
         if data:
             for w, wdata in data.items():
                 self.words[w] = WordEntry(
@@ -463,16 +627,15 @@ class WordsMemory:
                 )
 
 # ============================================================
-# MÉMOIRE: ERRORS (fautes corrigées)
+# MÉMOIRE: ERREURS
 # ============================================================
 
-class ErrorsMemory:
-    """Fautes et corrections - SQLite avec nettoyage."""
+class ErrorMemory(MemoryInterface):
+    """Fautes et corrections apprises."""
     
     def __init__(self, db_path: Path, gem: Gem):
         self.db_path = Path(db_path)
         self.gem = gem
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._init_db()
     
@@ -482,25 +645,23 @@ class ErrorsMemory:
                 CREATE TABLE IF NOT EXISTS errors (
                     wrong TEXT PRIMARY KEY,
                     correct TEXT NOT NULL,
+                    concept TEXT,
                     confidence REAL DEFAULT 0.8,
                     count INTEGER DEFAULT 1,
                     first_seen REAL,
                     last_seen REAL,
-                    source_weights TEXT,  -- JSON dict
-                    contexts TEXT          -- JSON list
+                    source_weights TEXT,
+                    contexts TEXT
                 )
             """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_errors_last_seen 
-                ON errors(last_seen)
-            """)
+            conn.execute("CREATE INDEX idx_errors_last_seen ON errors(last_seen)")
     
-    def add(self, wrong: str, correct: str, 
-            source: SourceWeight = SourceWeight.SELF,
-            context: str = None):
+    def add(self, wrong: str, correct: str, concept: Optional[str] = None,
+            source: SourceInfo = None, context: str = None):
         wrong = wrong.lower()
         correct = correct.lower()
         now = time.time()
+        source = source or SourceInfo(type=SourceWeight.SELF)
         
         with self._lock, sqlite3.connect(self.db_path) as conn:
             cur = conn.execute(
@@ -512,119 +673,234 @@ class ErrorsMemory:
             if row:
                 old_conf, count, weights_json = row
                 weights = json.loads(weights_json) if weights_json else {}
-                
-                # Mettre à jour le poids de la source
-                weights[source.value] = weights.get(source.value, 0) + 1
-                
-                # La confiance augmente avec le nombre et la qualité des sources
-                new_conf = min(0.95, old_conf + (source.value * 0.1))
-                
+                weights[source.type.name] = weights.get(source.type.name, 0) + 1
+                new_conf = min(0.95, old_conf + 0.03)
                 conn.execute("""
                     UPDATE errors 
                     SET confidence = ?, count = ?, last_seen = ?, source_weights = ?
                     WHERE wrong = ?
                 """, (new_conf, count + 1, now, json.dumps(weights), wrong))
             else:
-                weights = {source.value: 1}
+                weights = {source.type.name: 1}
                 conn.execute("""
                     INSERT INTO errors 
-                    (wrong, correct, confidence, count, first_seen, last_seen, source_weights)
-                    VALUES (?, ?, ?, 1, ?, ?, ?)
-                """, (wrong, correct, source.value, now, now, json.dumps(weights)))
+                    (wrong, correct, concept, confidence, count, first_seen, last_seen, source_weights)
+                    VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+                """, (wrong, correct, concept, source.type.value, now, now, json.dumps(weights)))
     
-    def get(self, wrong: str) -> Optional[Tuple[str, float]]:
+    def get(self, wrong: str) -> Optional[Tuple[str, float, Optional[str]]]:
         wrong = wrong.lower()
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.execute(
-                "SELECT correct, confidence FROM errors WHERE wrong = ?",
+                "SELECT correct, confidence, concept FROM errors WHERE wrong = ?",
                 (wrong,)
             )
             row = cur.fetchone()
             if row:
-                return row[0], row[1]
+                return row[0], row[1], row[2]
         return None
     
-    def get_all(self, wrong: str) -> List[Dict]:
-        """Toutes les corrections possibles (pour ambiguïté)."""
-        wrong = wrong.lower()
-        results = []
-        
-        with sqlite3.connect(self.db_path) as conn:
-            # Correspondance exacte
-            cur = conn.execute(
-                "SELECT correct, confidence, count FROM errors WHERE wrong = ?",
-                (wrong,)
-            )
-            row = cur.fetchone()
-            if row:
-                results.append({
-                    "correct": row[0],
-                    "confidence": row[1],
-                    "count": row[2]
-                })
-            
-            # Correspondances similaires
-            cur = conn.execute("""
-                SELECT wrong, correct, confidence, count FROM errors 
-                WHERE wrong LIKE ? OR ? LIKE ('%' || wrong || '%')
-                LIMIT 10
-            """, (f"%{wrong}%", wrong))
-            
-            for w, c, conf, cnt in cur:
-                if w != wrong:
-                    results.append({
-                        "correct": c,
-                        "confidence": conf * 0.7,
-                        "similar_to": w,
-                        "count": cnt
-                    })
-        
-        results.sort(key=lambda x: x["confidence"], reverse=True)
-        return results[:5]
+    def query(self, query_type: str, constraints: Dict, context: Dict) -> Dict:
+        if query_type == "correction":
+            word = constraints.get("word", "")
+            result = self.get(word)
+            if result:
+                correct, conf, concept = result
+                return {
+                    "correct": correct,
+                    "confidence": conf,
+                    "concept": concept
+                }
+        return {}
     
-    def cleanup(self):
-        """Nettoyage nocturne selon le Gem."""
-        max_age_days = self.gem.duree_memoire_episodique
-        cutoff = time.time() - (max_age_days * 24 * 3600)
+    def update(self, intent: StructuredIntent) -> bool:
+        if intent.semantic.get("sub_intent") == "correction":
+            wrong = intent.attributes.get("wrong")
+            correct = intent.attributes.get("correct")
+            if wrong and correct:
+                source = SourceInfo(type=SourceWeight.SELF, speaker=intent.speaker)
+                self.add(wrong.value, correct.value, source=source)
+                return True
+        return False
+    
+    def consolidate(self) -> Dict:
+        """Nettoyage nocturne des erreurs."""
+        max_age = self.gem.duree_memoire_episodique
+        cutoff = time.time() - (max_age * 24 * 3600)
         
         with self._lock, sqlite3.connect(self.db_path) as conn:
-            # Supprimer les vieilles erreurs peu fiables
             cur = conn.execute("""
                 DELETE FROM errors 
                 WHERE last_seen < ? AND confidence < 0.3
             """, (cutoff,))
             deleted = cur.rowcount
-            
-            if deleted > 0:
-                logger.info(f"🧹 Nettoyage erreurs: {deleted} supprimées")
-            
-            return deleted
+            return {"errors_deleted": deleted}
+    
+    def relevance(self, query_type: str, constraints: Dict) -> float:
+        return 0.8 if query_type == "correction" else 0.1
 
 # ============================================================
-# MÉMOIRE: TEMPORAL (expressions temporelles)
+# MÉMOIRE: SOCIALE
+# ============================================================
+
+@dataclass
+class Person:
+    id: str
+    name: str
+    nicknames: Set[str]
+    relation: str
+    gender: str
+    weight: float
+    metadata: Dict[str, Any]
+    first_met: float
+    last_interaction: float
+    interaction_count: int
+
+class SocialMemory(MemoryInterface):
+    """Personnes et relations."""
+    
+    def __init__(self, db_path: Path, gem: Gem):
+        self.db_path = Path(db_path)
+        self.gem = gem
+        self._lock = threading.RLock()
+        self._init_db()
+    
+    def _init_db(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS persons (
+                    id TEXT PRIMARY KEY,
+                    name TEXT,
+                    nicknames TEXT,
+                    relation TEXT,
+                    gender TEXT,
+                    weight REAL DEFAULT 1.0,
+                    metadata TEXT,
+                    first_met REAL,
+                    last_interaction REAL,
+                    interaction_count INTEGER DEFAULT 0
+                )
+            """)
+            conn.execute("CREATE INDEX idx_persons_name ON persons(name)")
+    
+    def add_person(self, name: str, relation: str = "unknown",
+                   source: SourceInfo = None) -> str:
+        pid = f"person_{uuid.uuid4().hex[:8]}"
+        now = time.time()
+        weight = source.type.value if source else 1.0
+        
+        with self._lock, sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT INTO persons 
+                (id, name, nicknames, relation, gender, weight, metadata, first_met, last_interaction, interaction_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (pid, name, json.dumps([]), relation, "unknown",
+                  weight, json.dumps({}), now, now, 1))
+        return pid
+    
+    def find_by_name(self, name: str) -> Optional[Dict]:
+        name_lower = name.lower()
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                "SELECT * FROM persons WHERE LOWER(name) = ?",
+                (name_lower,)
+            )
+            row = cur.fetchone()
+            if row:
+                return self._row_to_dict(row)
+            
+            # Recherche dans les nicknames
+            cur = conn.execute("SELECT id, nicknames FROM persons")
+            for pid, nick_json in cur:
+                nicknames = json.loads(nick_json)
+                if name_lower in [n.lower() for n in nicknames]:
+                    cur2 = conn.execute("SELECT * FROM persons WHERE id = ?", (pid,))
+                    row2 = cur2.fetchone()
+                    if row2:
+                        return self._row_to_dict(row2)
+        return None
+    
+    def add_interaction(self, person_id: str):
+        with self._lock, sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                UPDATE persons 
+                SET weight = weight + 1, last_interaction = ?, interaction_count = interaction_count + 1
+                WHERE id = ?
+            """, (time.time(), person_id))
+    
+    def query(self, query_type: str, constraints: Dict, context: Dict) -> Dict:
+        if query_type == "person":
+            name = constraints.get("name")
+            if name:
+                person = self.find_by_name(name)
+                if person:
+                    return {
+                        "person": person,
+                        "confidence": min(1.0, person["weight"] / 10)
+                    }
+        return {}
+    
+    def update(self, intent: StructuredIntent) -> bool:
+        if intent.semantic.get("sub_intent") == "new_person":
+            name = intent.attributes.get("name")
+            if name:
+                source = SourceInfo(type=SourceWeight.SELF, speaker=intent.speaker)
+                self.add_person(name.value, source=source)
+                return True
+        return False
+    
+    def consolidate(self) -> Dict:
+        """Nettoyage social - poids protège de l'oubli."""
+        max_age = self.gem.duree_memoire_sociale
+        cutoff = time.time() - (max_age * 24 * 3600)
+        
+        with self._lock, sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute("""
+                DELETE FROM persons 
+                WHERE last_interaction < ? AND weight < 5
+            """, (cutoff,))
+            deleted = cur.rowcount
+            return {"social_deleted": deleted}
+    
+    def relevance(self, query_type: str, constraints: Dict) -> float:
+        return 0.9 if query_type == "person" else 0.1
+    
+    def _row_to_dict(self, row) -> Dict:
+        return {
+            "id": row[0],
+            "name": row[1],
+            "nicknames": json.loads(row[2]),
+            "relation": row[3],
+            "gender": row[4],
+            "weight": row[5],
+            "metadata": json.loads(row[6]),
+            "first_met": row[7],
+            "last_interaction": row[8],
+            "interaction_count": row[9]
+        }
+
+# ============================================================
+# MÉMOIRE: TEMPORELLE
 # ============================================================
 
 @dataclass
 class TemporalExpression:
     expression: str
-    type: str  # "relative", "absolute", "recurring"
-    resolution: str  # Comment résoudre
+    type: str
+    resolution: str
     synonyms: Set[str] = field(default_factory=set)
-    source_weights: Dict[str, float] = field(default_factory=dict)
 
-class TemporalMemory:
-    """Expressions temporelles - permanent."""
+class TemporalMemory(MemoryInterface):
+    """Expressions temporelles."""
     
-    def __init__(self, storage: CompressedStorage, libs: ExternalLibraries):
+    def __init__(self, storage: CompressedStorage):
         self.storage = storage
-        self.libs = libs
         self.expressions: Dict[str, TemporalExpression] = {}
         self._lock = threading.RLock()
         self._init_defaults()
         self._load()
     
     def _init_defaults(self):
-        """Expressions de base (minimum)."""
         defaults = [
             ("aujourd'hui", "relative", "today"),
             ("demain", "relative", "tomorrow"),
@@ -635,91 +911,39 @@ class TemporalMemory:
             ("ce soir", "relative", "this_evening"),
             ("cette nuit", "relative", "tonight"),
         ]
-        
         for expr, typ, res in defaults:
-            self.expressions[expr] = TemporalExpression(
-                expression=expr,
-                type=typ,
-                resolution=res
+            self.expressions[expr] = TemporalExpression(expr, typ, res)
+        self.expressions["aujourd'hui"].synonyms = {"ajd", "auj"}
+        self.expressions["demain"].synonyms = {"dem", "2m1"}
+    
+    def resolve(self, expr: str, base: Optional[datetime] = None) -> Optional[TemporalInfo]:
+        expr_lower = expr.lower()
+        if expr_lower in self.expressions:
+            e = self.expressions[expr_lower]
+            return TemporalInfo(
+                raw=expr,
+                confidence=0.9,
+                source="temporal_memory"
             )
+        return None
     
-    def add(self, expression: str, resolution: str, type: str = "relative",
-            source: SourceWeight = SourceWeight.EDUCATIVE):
-        expr = expression.lower()
-        with self._lock:
-            if expr not in self.expressions:
-                self.expressions[expr] = TemporalExpression(
-                    expression=expr,
-                    type=type,
-                    resolution=resolution
-                )
-            
-            self.expressions[expr].source_weights[source.value] = \
-                self.expressions[expr].source_weights.get(source.value, 0) + source.value
-            
-            self._save()
+    def query(self, query_type: str, constraints: Dict, context: Dict) -> Dict:
+        if query_type == "resolve":
+            expr = constraints.get("expression")
+            if expr:
+                result = self.resolve(expr)
+                if result:
+                    return {"temporal": asdict(result)}
+        return {}
     
-    def add_synonym(self, expression: str, synonym: str,
-                    source: SourceWeight = SourceWeight.EDUCATIVE):
-        expr = expression.lower()
-        syn = synonym.lower()
-        with self._lock:
-            if expr in self.expressions:
-                self.expressions[expr].synonyms.add(syn)
-            self._save()
+    def update(self, intent: StructuredIntent) -> bool:
+        return False
     
-    def resolve(self, text: str, reference: datetime = None) -> Optional[Dict]:
-        """Résout une expression temporelle."""
-        text = text.lower()
-        
-        # Utiliser dateparser si disponible
-        if self.libs.have_dateparser:
-            try:
-                parsed = self.libs.dateparser.parse(
-                    text,
-                    languages=['fr'],
-                    settings={
-                        'PREFER_DATES_FROM': 'future',
-                        'RELATIVE_BASE': reference or datetime.now()
-                    }
-                )
-                if parsed:
-                    return {
-                        "success": True,
-                        "iso": parsed.isoformat(),
-                        "timestamp": parsed.timestamp(),
-                        "expression": text,
-                        "confidence": 0.95,
-                        "source": "dateparser"
-                    }
-            except:
-                pass
-        
-        # Fallback sur le dictionnaire interne
-        if text in self.expressions:
-            expr = self.expressions[text]
-            return {
-                "success": True,
-                "type": expr.type,
-                "resolution": expr.resolution,
-                "expression": text,
-                "confidence": 0.8,
-                "source": "internal"
-            }
-        
-        # Synonymes
-        for expr, data in self.expressions.items():
-            if text in data.synonyms:
-                return {
-                    "success": True,
-                    "type": data.type,
-                    "resolution": data.resolution,
-                    "expression": expr,
-                    "confidence": 0.7,
-                    "source": "synonym"
-                }
-        
-        return {"success": False, "expression": text}
+    def consolidate(self) -> Dict:
+        return {"temporal_expressions": len(self.expressions)}
+    
+    def relevance(self, query_type: str, constraints: Dict) -> float:
+        return 0.7 if query_type == "resolve" else 0.1
     
     def _save(self):
         data = {
@@ -727,8 +951,7 @@ class TemporalMemory:
                 "expression": expr.expression,
                 "type": expr.type,
                 "resolution": expr.resolution,
-                "synonyms": list(expr.synonyms),
-                "source_weights": expr.source_weights
+                "synonyms": list(expr.synonyms)
             } for e, expr in self.expressions.items()
         }
         self.storage.save_json("temporal_memory", data)
@@ -741,21 +964,19 @@ class TemporalMemory:
                     expression=edata["expression"],
                     type=edata["type"],
                     resolution=edata["resolution"],
-                    synonyms=set(edata.get("synonyms", [])),
-                    source_weights=edata.get("source_weights", {})
+                    synonyms=set(edata.get("synonyms", []))
                 )
 
 # ============================================================
-# MÉMOIRE: EPISODIC (expériences vécues)
+# MÉMOIRE: ÉPISODIQUE
 # ============================================================
 
-class EpisodicMemory:
-    """Expériences vécues - SQLite avec TTL selon le Gem."""
+class EpisodicMemory(MemoryInterface):
+    """Expériences vécues avec TTL."""
     
     def __init__(self, db_path: Path, gem: Gem):
         self.db_path = Path(db_path)
         self.gem = gem
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._init_db()
     
@@ -764,277 +985,131 @@ class EpisodicMemory:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS episodic (
                     id TEXT PRIMARY KEY,
-                    subject TEXT,
-                    predicate TEXT,
-                    object TEXT,
-                    context TEXT,  -- JSON
-                    importance REAL,
+                    concept TEXT,
+                    verb TEXT,
+                    agent TEXT,
+                    objects TEXT,
+                    location TEXT,
+                    start_time REAL,
+                    end_time REAL,
+                    salience REAL,
                     source_weight REAL,
-                    created REAL,
-                    last_recalled REAL,
-                    recall_count INTEGER DEFAULT 0
+                    intent_id TEXT,
+                    raw_text TEXT,
+                    ts REAL
                 )
             """)
-            conn.execute("CREATE INDEX idx_episodic_created ON episodic(created)")
+            conn.execute("CREATE INDEX idx_episodic_concept ON episodic(concept)")
+            conn.execute("CREATE INDEX idx_episodic_ts ON episodic(ts)")
     
-    def add(self, subject: str, predicate: str, object: str,
-            context: Dict, importance: float = 0.5,
-            source: SourceWeight = SourceWeight.OBSERVATION) -> str:
-        mid = f"ep_{uuid.uuid4().hex[:8]}"
+    def add_event(self, concept: Concept, verb: str, agent: List[str],
+                  objects: List[str], location: Optional[str],
+                  start_time: Optional[float], end_time: Optional[float],
+                  salience: float, source: SourceInfo,
+                  intent_id: str, raw_text: str) -> str:
+        eid = f"ep_{uuid.uuid4().hex[:8]}"
         now = time.time()
         
         with self._lock, sqlite3.connect(self.db_path) as conn:
             conn.execute("""
                 INSERT INTO episodic 
-                (id, subject, predicate, object, context, importance, 
-                 source_weight, created, last_recalled)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (mid, subject, predicate, object, json.dumps(context),
-                  importance, source.value, now, now))
-        
-        return mid
+                (id, concept, verb, agent, objects, location, start_time, end_time,
+                 salience, source_weight, intent_id, raw_text, ts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (eid, concept.value, verb, json.dumps(agent), json.dumps(objects),
+                  location, start_time, end_time, salience, source.type.value,
+                  intent_id, raw_text, now))
+        return eid
     
-    def query(self, subject: str = None, predicate: str = None,
-              days: int = None) -> List[Dict]:
-        """Recherche avec limite de temps."""
-        if days is None:
-            days = self.gem.duree_memoire_episodique
-        
+    def query_by_concept(self, concept: Concept, days: int = 30) -> List[Dict]:
         cutoff = time.time() - (days * 24 * 3600)
         results = []
         
         with sqlite3.connect(self.db_path) as conn:
-            sql = "SELECT * FROM episodic WHERE created > ?"
-            params = [cutoff]
+            cur = conn.execute("""
+                SELECT * FROM episodic 
+                WHERE concept = ? AND ts > ?
+                ORDER BY ts DESC
+            """, (concept.value, cutoff))
             
-            if subject:
-                sql += " AND subject = ?"
-                params.append(subject)
-            if predicate:
-                sql += " AND predicate = ?"
-                params.append(predicate)
-            
-            cur = conn.execute(sql, params)
             for row in cur:
                 results.append({
                     "id": row[0],
-                    "subject": row[1],
-                    "predicate": row[2],
-                    "object": row[3],
-                    "context": json.loads(row[4]),
-                    "importance": row[5],
-                    "source_weight": row[6],
-                    "created": row[7],
-                    "last_recalled": row[8],
-                    "recall_count": row[9]
+                    "concept": row[1],
+                    "verb": row[2],
+                    "agent": json.loads(row[3]),
+                    "objects": json.loads(row[4]),
+                    "location": row[5],
+                    "start_time": row[6],
+                    "end_time": row[7],
+                    "salience": row[8],
+                    "source_weight": row[9],
+                    "intent_id": row[10],
+                    "raw_text": row[11],
+                    "ts": row[12]
                 })
-        
-        # Mettre à jour last_recalled
-        for r in results:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute("""
-                    UPDATE episodic 
-                    SET last_recalled = ?, recall_count = recall_count + 1
-                    WHERE id = ?
-                """, (time.time(), r["id"]))
-        
         return results
     
-    def cleanup(self):
-        """Nettoyage selon les durées du Gem."""
+    def query(self, query_type: str, constraints: Dict, context: Dict) -> Dict:
+        if query_type == "by_concept":
+            concept_name = constraints.get("concept")
+            days = constraints.get("days", 30)
+            if concept_name:
+                try:
+                    concept = Concept(concept_name)
+                    results = self.query_by_concept(concept, days)
+                    return {
+                        "events": results,
+                        "count": len(results),
+                        "confidence": 0.8
+                    }
+                except ValueError:
+                    pass
+        return {"events": [], "count": 0}
+    
+    def update(self, intent: StructuredIntent) -> bool:
+        if intent.semantic.get("type") == IntentType.INFORMATION:
+            # Les intents information sont automatiquement stockés
+            concept_name = intent.analysis.get("verb", {}).get("concept")
+            if concept_name:
+                try:
+                    concept = Concept(concept_name)
+                    self.add_event(
+                        concept=concept,
+                        verb=intent.analysis.get("verb", {}).get("lemma", "unknown"),
+                        agent=[intent.speaker] if intent.speaker else [],
+                        objects=[],
+                        location=intent.context.get("where"),
+                        start_time=None,
+                        end_time=None,
+                        salience=intent.memory_hint.get("salience", 0.3),
+                        source=SourceInfo(type=SourceWeight.OBSERVATION),
+                        intent_id=intent.id,
+                        raw_text=intent.attributes.get("text", {}).value if "text" in intent.attributes else ""
+                    )
+                    return True
+                except ValueError:
+                    pass
+        return False
+    
+    def consolidate(self) -> Dict:
+        """Nettoyage des vieux souvenirs peu importants."""
         max_age = self.gem.duree_memoire_episodique
-        min_importance = 0.3
         cutoff = time.time() - (max_age * 24 * 3600)
         
         with self._lock, sqlite3.connect(self.db_path) as conn:
             cur = conn.execute("""
                 DELETE FROM episodic 
-                WHERE created < ? AND importance < ?
-            """, (cutoff, min_importance))
+                WHERE ts < ? AND salience < ?
+            """, (cutoff, CONFIG["min_salience"]))
             deleted = cur.rowcount
-            
-            if deleted > 0:
-                logger.info(f"🧹 Nettoyage épisodique: {deleted} souvenirs supprimés")
-            
-            return deleted
+            return {"episodic_deleted": deleted}
+    
+    def relevance(self, query_type: str, constraints: Dict) -> float:
+        return 0.9 if query_type == "by_concept" else 0.1
 
 # ============================================================
-# MÉMOIRE: SOCIAL (personnes et relations)
-# ============================================================
-
-@dataclass
-class Person:
-    id: str
-    name: str
-    nicknames: Set[str]
-    relation: str
-    gender: str
-    weight: float  # Poids basé sur les interactions
-    metadata: Dict[str, Any]
-    first_met: float
-    last_interaction: float
-    interaction_count: int
-
-class SocialMemory:
-    """Personnes et relations - SQLite avec poids."""
-    
-    def __init__(self, db_path: Path, gem: Gem):
-        self.db_path = Path(db_path)
-        self.gem = gem
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.RLock()
-        self._init_db()
-    
-    def _init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS persons (
-                    id TEXT PRIMARY KEY,
-                    name TEXT,
-                    nicknames TEXT,  -- JSON list
-                    relation TEXT,
-                    gender TEXT,
-                    weight REAL DEFAULT 1.0,
-                    metadata TEXT,   -- JSON
-                    first_met REAL,
-                    last_interaction REAL,
-                    interaction_count INTEGER DEFAULT 0
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS relationships (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    source TEXT,
-                    target TEXT,
-                    type TEXT,
-                    strength REAL,
-                    FOREIGN KEY(source) REFERENCES persons(id),
-                    FOREIGN KEY(target) REFERENCES persons(id)
-                )
-            """)
-            conn.execute("CREATE INDEX idx_persons_name ON persons(name)")
-    
-    def add_person(self, name: str, relation: str = "unknown",
-                   source: SourceWeight = SourceWeight.SELF) -> Person:
-        pid = f"person_{uuid.uuid4().hex[:8]}"
-        now = time.time()
-        weight = source.value  # Poids initial basé sur la source
-        
-        with self._lock, sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
-                INSERT INTO persons 
-                (id, name, nicknames, relation, gender, weight, metadata, 
-                 first_met, last_interaction, interaction_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (pid, name, json.dumps([]), relation, "unknown",
-                  weight, json.dumps({}), now, now, 1))
-        
-        return self.get_person(pid)
-    
-    def get_person(self, person_id: str) -> Optional[Person]:
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute("SELECT * FROM persons WHERE id = ?", (person_id,))
-            row = cur.fetchone()
-            if row:
-                return Person(
-                    id=row[0],
-                    name=row[1],
-                    nicknames=set(json.loads(row[2])),
-                    relation=row[3],
-                    gender=row[4],
-                    weight=row[5],
-                    metadata=json.loads(row[6]),
-                    first_met=row[7],
-                    last_interaction=row[8],
-                    interaction_count=row[9]
-                )
-        return None
-    
-    def find_by_name(self, name: str) -> Optional[Person]:
-        name_lower = name.lower()
-        with sqlite3.connect(self.db_path) as conn:
-            # Recherche exacte
-            cur = conn.execute(
-                "SELECT * FROM persons WHERE LOWER(name) = ?",
-                (name_lower,)
-            )
-            row = cur.fetchone()
-            if row:
-                return self._row_to_person(row)
-            
-            # Recherche dans les surnoms
-            cur = conn.execute("SELECT id, nicknames FROM persons")
-            for pid, nicknames_json in cur:
-                nicknames = json.loads(nicknames_json)
-                if name_lower in [n.lower() for n in nicknames]:
-                    return self.get_person(pid)
-        
-        return None
-    
-    def add_interaction(self, person_id: str):
-        """Chaque interaction augmente le poids."""
-        with self._lock, sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
-                UPDATE persons 
-                SET weight = weight + 1,
-                    last_interaction = ?,
-                    interaction_count = interaction_count + 1
-                WHERE id = ?
-            """, (time.time(), person_id))
-    
-    def add_nickname(self, person_id: str, nickname: str,
-                     source: SourceWeight = SourceWeight.SELF):
-        with self._lock, sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute(
-                "SELECT nicknames, weight FROM persons WHERE id = ?",
-                (person_id,)
-            )
-            row = cur.fetchone()
-            if row:
-                nicknames = set(json.loads(row[0]))
-                nicknames.add(nickname)
-                # Augmenter le poids si c'est une source fiable
-                weight_increase = source.value * 0.5
-                conn.execute("""
-                    UPDATE persons 
-                    SET nicknames = ?, weight = weight + ?
-                    WHERE id = ?
-                """, (json.dumps(list(nicknames)), weight_increase, person_id))
-    
-    def cleanup(self):
-        """Nettoyage social - le poids protège de l'oubli."""
-        max_age = self.gem.duree_memoire_sociale
-        cutoff = time.time() - (max_age * 24 * 3600)
-        
-        with self._lock, sqlite3.connect(self.db_path) as conn:
-            # Ne supprimer que les personnes avec faible poids ET vieilles
-            cur = conn.execute("""
-                DELETE FROM persons 
-                WHERE last_interaction < ? AND weight < 5
-            """, (cutoff,))
-            deleted = cur.rowcount
-            
-            if deleted > 0:
-                logger.info(f"🧹 Nettoyage social: {deleted} personnes oubliées")
-            
-            return deleted
-    
-    def _row_to_person(self, row) -> Person:
-        return Person(
-            id=row[0],
-            name=row[1],
-            nicknames=set(json.loads(row[2])),
-            relation=row[3],
-            gender=row[4],
-            weight=row[5],
-            metadata=json.loads(row[6]),
-            first_met=row[7],
-            last_interaction=row[8],
-            interaction_count=row[9]
-        )
-
-# ============================================================
-# MÉMOIRE: LITERARY ROMAN (éphémère, refroidit)
+# MÉMOIRE: ROMANS (éphémère)
 # ============================================================
 
 @dataclass
@@ -1052,34 +1127,21 @@ class Roman:
     last_accessed: float = field(default_factory=time.time)
     access_count: int = 0
 
-class RomanMemory:
-    """Romans - éphémère, refroidit selon les affinités du Gem."""
+class RomanMemory(MemoryInterface):
+    """Romans - éphémère, refroidit."""
     
     def __init__(self, storage: CompressedStorage, gem: Gem):
         self.storage = storage
         self.gem = gem
         self.romans: Dict[str, Roman] = {}
-        self.cooling_rate = 0.05  # base par heure
         self.last_cooling = time.time()
         self._lock = threading.RLock()
         self._load()
-        self._start_cooling()
-    
-    def _start_cooling(self):
-        def cool():
-            while True:
-                time.sleep(3600)  # 1 heure
-                self.apply_cooling()
-        threading.Thread(target=cool, daemon=True).start()
     
     def add(self, title: str, author: str, genre: str,
             characters: List[str], summary: str, themes: List[str],
-            source: SourceWeight = SourceWeight.FICTION,
-            year: int = None) -> str:
-        
+            source: SourceInfo, year: int = None) -> str:
         rid = f"roman_{uuid.uuid4().hex[:8]}"
-        
-        # La température initiale dépend de l'affinité pour le genre
         affinite = self.gem.affinites_litterature.get(genre, 0.5)
         temp_initiale = 0.5 + (affinite * 0.5)
         
@@ -1093,7 +1155,7 @@ class RomanMemory:
                 characters=characters,
                 summary=summary,
                 themes=themes,
-                source_weight=source.value,
+                source_weight=source.type.value,
                 temperature=temp_initiale
             )
             self._save()
@@ -1105,7 +1167,6 @@ class RomanMemory:
                 r = self.romans[roman_id]
                 r.access_count += 1
                 r.last_accessed = time.time()
-                # Réchauffer à l'accès
                 affinite = self.gem.affinites_litterature.get(r.genre, 0.5)
                 r.temperature = min(1.0, r.temperature + (0.1 * affinite))
                 self._save()
@@ -1117,56 +1178,72 @@ class RomanMemory:
         with self._lock:
             results = []
             for r in self.romans.values():
-                if r.temperature < 0.1:  # trop froid
+                if r.temperature < CONFIG["freezing_threshold"]:
                     continue
                 if q in r.title.lower() or q in r.author.lower():
                     results.append(r)
-                    # Réchauffer légèrement
                     affinite = self.gem.affinites_litterature.get(r.genre, 0.5)
                     r.temperature = min(1.0, r.temperature + (0.05 * affinite))
             self._save()
             return results
     
     def apply_cooling(self):
-        """Refroidissement influencé par le Gem."""
         now = time.time()
         hours = (now - self.last_cooling) / 3600
         
         with self._lock:
             to_remove = []
             for rid, r in self.romans.items():
-                # Le refroidissement dépend de l'affinité
                 affinite = self.gem.affinites_litterature.get(r.genre, 0.5)
-                facteur = 1.0 - (affinite * 0.5)  # moins de refroidissement si affinité
-                
-                r.temperature = max(0.0, r.temperature - (self.cooling_rate * hours * facteur))
-                
-                if r.temperature < 0.1:
+                facteur = 1.0 - (affinite * 0.5)
+                r.temperature = max(0.0, r.temperature - (CONFIG["cooling_rate_hourly"] * hours * facteur))
+                if r.temperature < CONFIG["freezing_threshold"]:
                     to_remove.append(rid)
             
             for rid in to_remove:
                 logger.info(f"❄️ Roman oublié: {self.romans[rid].title}")
-                # Archiver avant suppression
-                self._archive(rid)
                 del self.romans[rid]
             
             self.last_cooling = now
             self._save()
     
-    def _archive(self, roman_id: str):
-        """Archive un roman avant oubli."""
-        if roman_id in self.romans:
-            r = self.romans[roman_id]
-            archive = {
-                "id": r.id,
-                "title": r.title,
-                "author": r.author,
-                "genre": r.genre,
-                "disappeared": time.time(),
-                "access_count": r.access_count,
-                "temperature_finale": r.temperature
+    def query(self, query_type: str, constraints: Dict, context: Dict) -> Dict:
+        if query_type == "search":
+            query = constraints.get("query", "")
+            results = self.search(query)
+            return {
+                "romans": [asdict(r) for r in results],
+                "count": len(results)
             }
-            self.storage.save_json(f"roman_archive_{r.id}", archive)
+        return {"romans": []}
+    
+    def update(self, intent: StructuredIntent) -> bool:
+        if intent.semantic.get("sub_intent") == "new_roman":
+            title = intent.attributes.get("title")
+            author = intent.attributes.get("author")
+            if title and author:
+                source = SourceInfo(
+                    type=SourceWeight.FICTION,
+                    speaker=intent.speaker
+                )
+                self.add(
+                    title=title.value,
+                    author=author.value,
+                    genre=intent.attributes.get("genre", Attribute(type="string", value="roman")).value,
+                    characters=intent.attributes.get("characters", Attribute(type="list", value=[])).value,
+                    summary=intent.attributes.get("summary", Attribute(type="string", value="")).value,
+                    themes=intent.attributes.get("themes", Attribute(type="list", value=[])).value,
+                    source=source
+                )
+                return True
+        return False
+    
+    def consolidate(self) -> Dict:
+        self.apply_cooling()
+        return {"romans": len(self.romans)}
+    
+    def relevance(self, query_type: str, constraints: Dict) -> float:
+        return 0.8 if query_type == "search" else 0.1
     
     def _save(self):
         data = {
@@ -1207,7 +1284,7 @@ class RomanMemory:
                 )
 
 # ============================================================
-# MÉMOIRE: LITERARY EDUC (permanent)
+# MÉMOIRE: ÉDUCATIVE (permanente)
 # ============================================================
 
 @dataclass
@@ -1222,7 +1299,7 @@ class EducationalWork:
     source_weight: float
     learned_date: float = field(default_factory=time.time)
 
-class EducationalMemory:
+class EducationalMemory(MemoryInterface):
     """Littérature éducative - permanente."""
     
     def __init__(self, storage: CompressedStorage):
@@ -1233,9 +1310,8 @@ class EducationalMemory:
     
     def add(self, title: str, author: str, period: str,
             genre: str, importance: float, content: Dict,
-            source: SourceWeight = SourceWeight.EDUCATIVE) -> str:
+            source: SourceInfo) -> str:
         wid = f"edu_{uuid.uuid4().hex[:8]}"
-        
         with self._lock:
             self.works[wid] = EducationalWork(
                 id=wid,
@@ -1245,24 +1321,53 @@ class EducationalMemory:
                 genre=genre,
                 importance=importance,
                 content=content,
-                source_weight=source.value
+                source_weight=source.type.value
             )
             self._save()
             return wid
     
-    def get(self, work_id: str) -> Optional[EducationalWork]:
-        return self.works.get(work_id)
-    
-    def search_by_period(self, period: str) -> List[EducationalWork]:
-        return [w for w in self.works.values() if w.period == period]
-    
-    def search_by_genre(self, genre: str) -> List[EducationalWork]:
-        return [w for w in self.works.values() if w.genre == genre]
-    
     def search(self, query: str) -> List[EducationalWork]:
         q = query.lower()
-        return [w for w in self.works.values() 
-                if q in w.title.lower() or q in w.author.lower()]
+        with self._lock:
+            return [w for w in self.works.values() 
+                    if q in w.title.lower() or q in w.author.lower()]
+    
+    def query(self, query_type: str, constraints: Dict, context: Dict) -> Dict:
+        if query_type == "search":
+            query = constraints.get("query", "")
+            results = self.search(query)
+            return {
+                "works": [asdict(w) for w in results],
+                "count": len(results)
+            }
+        return {"works": []}
+    
+    def update(self, intent: StructuredIntent) -> bool:
+        if intent.semantic.get("sub_intent") == "new_knowledge":
+            title = intent.attributes.get("title")
+            if title:
+                source = SourceInfo(
+                    type=SourceWeight.EDUCATIVE,
+                    speaker=intent.speaker
+                )
+                self.add(
+                    title=title.value,
+                    author=intent.attributes.get("author", Attribute(type="string", value="")).value,
+                    period=intent.attributes.get("period", Attribute(type="string", value="contemporain")).value,
+                    genre=intent.attributes.get("genre", Attribute(type="string", value="essai")).value,
+                    importance=intent.attributes.get("importance", Attribute(type="number", value=0.8)).value,
+                    content=intent.attributes.get("content", Attribute(type="object", value={})).value,
+                    source=source
+                )
+                return True
+        return False
+    
+    def consolidate(self) -> Dict:
+        with self._lock:
+            return {"educational": len(self.works)}
+    
+    def relevance(self, query_type: str, constraints: Dict) -> float:
+        return 0.7 if query_type == "search" else 0.1
     
     def _save(self):
         data = {
@@ -1331,8 +1436,8 @@ class NarrativeBook:
     chapters: Dict[int, NarrativeChapter]
     summary: str = ""
 
-class NarrativeMemory:
-    """Livre de vie - structure livre/chapitre/section/page."""
+class NarrativeMemory(MemoryInterface):
+    """Livre de vie structuré."""
     
     def __init__(self, base_path: Path, storage: CompressedStorage):
         self.base_path = Path(base_path)
@@ -1357,7 +1462,7 @@ class NarrativeMemory:
             self._save_current()
             return book_id
     
-    def add_event(self, event: Dict, source: SourceWeight = SourceWeight.OBSERVATION):
+    def add_event(self, event: Dict, source: SourceInfo):
         if not self.current_book:
             self.start_new_book("default")
         
@@ -1365,30 +1470,21 @@ class NarrativeMemory:
         year = now.year
         month = now.month
         day = now.day
-        
         page_num = 1 if day <= 15 else 2
         
         with self._lock:
-            # Créer le chapitre si nécessaire
             if year not in self.current_book.chapters:
-                self.current_book.chapters[year] = NarrativeChapter(
-                    year=year,
-                    sections={}
-                )
+                self.current_book.chapters[year] = NarrativeChapter(year=year, sections={})
             
             chapter = self.current_book.chapters[year]
             
-            # Créer la section si nécessaire
             if month not in chapter.sections:
                 chapter.sections[month] = NarrativeSection(
-                    month=month,
-                    year=year,
-                    pages={}
+                    month=month, year=year, pages={}
                 )
             
             section = chapter.sections[month]
             
-            # Créer la page si nécessaire
             if page_num not in section.pages:
                 start_day = 1 if page_num == 1 else 16
                 end_day = 15 if page_num == 1 else 31
@@ -1399,19 +1495,15 @@ class NarrativeMemory:
                     events=[]
                 )
             
-            # Ajouter l'événement avec sa source
-            event['timestamp'] = time.time()
-            event['day'] = day
-            event['source'] = source.value
+            event["timestamp"] = time.time()
+            event["day"] = day
+            event["source"] = source.type.value
             section.pages[page_num].events.append(event)
-            
             self._save_current()
     
     def archive_month(self, year: int, month: int):
-        """Archive un mois."""
         if not self.current_book:
             return
-        
         if year not in self.current_book.chapters:
             return
         
@@ -1421,7 +1513,6 @@ class NarrativeMemory:
         
         section = chapter.sections[month]
         
-        # Sauvegarder dans un fichier d'archive
         archive_data = {
             "book_id": self.current_book.book_id,
             "embodiment": self.current_book.embodiment_name,
@@ -1442,7 +1533,6 @@ class NarrativeMemory:
         with gzip.open(archive_path, 'wt', encoding='utf-8') as f:
             json.dump(archive_data, f, ensure_ascii=False, indent=2)
         
-        # Vider la section courante
         with self._lock:
             for page in section.pages.values():
                 page.events = []
@@ -1451,12 +1541,32 @@ class NarrativeMemory:
         
         logger.info(f"📚 Mois {year}-{month:02d} archivé")
     
-    def end_book(self):
-        """Termine le livre courant."""
-        if self.current_book:
-            self.current_book.end_date = time.time()
-            self._save_book(self.current_book)
-            self.start_new_book(f"{self.current_book.embodiment_name}_next")
+    def query(self, query_type: str, constraints: Dict, context: Dict) -> Dict:
+        return {"book": asdict(self.current_book) if self.current_book else None}
+    
+    def update(self, intent: StructuredIntent) -> bool:
+        if intent.semantic.get("type") == IntentType.INFORMATION:
+            source = SourceInfo(
+                type=SourceWeight.OBSERVATION,
+                speaker=intent.speaker
+            )
+            self.add_event({
+                "intent_id": intent.id,
+                "type": intent.semantic.get("sub_intent"),
+                "attributes": {k: v.value for k, v in intent.attributes.items()}
+            }, source)
+            return True
+        return False
+    
+    def consolidate(self) -> Dict:
+        now = datetime.now()
+        last_month = now.month - 1 if now.month > 1 else 12
+        last_year = now.year if now.month > 1 else now.year - 1
+        self.archive_month(last_year, last_month)
+        return {"narrative_archived": f"{last_year}-{last_month:02d}"}
+    
+    def relevance(self, query_type: str, constraints: Dict) -> float:
+        return 0.1  # Peu pertinent pour les requêtes directes
     
     def _save_current(self):
         if self.current_book:
@@ -1475,7 +1585,6 @@ class NarrativeMemory:
                     "summary": chapter.summary,
                     "title": chapter.title
                 }
-                
                 for month, section in chapter.sections.items():
                     section_data = {
                         "month": section.month,
@@ -1483,7 +1592,6 @@ class NarrativeMemory:
                         "pages": {},
                         "summary": section.summary
                     }
-                    
                     for page_num, page in section.pages.items():
                         section_data["pages"][page_num] = {
                             "page_num": page.page_num,
@@ -1492,9 +1600,7 @@ class NarrativeMemory:
                             "events": page.events,
                             "summary": page.summary
                         }
-                    
                     chapter_data["sections"][month] = section_data
-                
                 data["chapters"][year] = chapter_data
             
             self.storage.save_json("current_book", data)
@@ -1518,7 +1624,6 @@ class NarrativeMemory:
                     summary=chapter_data.get("summary", ""),
                     title=chapter_data.get("title", "")
                 )
-                
                 for month_str, section_data in chapter_data.get("sections", {}).items():
                     month = int(month_str)
                     section = NarrativeSection(
@@ -1527,7 +1632,6 @@ class NarrativeMemory:
                         pages={},
                         summary=section_data.get("summary", "")
                     )
-                    
                     for page_num_str, page_data in section_data.get("pages", {}).items():
                         page_num = int(page_num_str)
                         section.pages[page_num] = NarrativePage(
@@ -1537,383 +1641,216 @@ class NarrativeMemory:
                             events=page_data.get("events", []),
                             summary=page_data.get("summary", "")
                         )
-                    
                     chapter.sections[month] = section
-                
                 book.chapters[year] = chapter
             
             self.current_book = book
-    
-    def _save_book(self, book: NarrativeBook):
-        """Sauvegarde un livre complet."""
-        data = {
-            "book_id": book.book_id,
-            "embodiment_name": book.embodiment_name,
-            "start_date": book.start_date,
-            "end_date": book.end_date,
-            "chapters": {}
-        }
-        
-        for year, chapter in book.chapters.items():
-            data["chapters"][year] = {
-                "year": chapter.year,
-                "sections": {},
-                "summary": chapter.summary,
-                "title": chapter.title
-            }
-            # ... (similaire à _save_current)
-        
-        archive_path = self.base_path / f"book_{book.book_id}.json.gz"
-        with gzip.open(archive_path, 'wt', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
 
 # ============================================================
-# NORMALISEUR DE TEXTE
+# CONCEPT RESOLVER
 # ============================================================
 
-class TextNormalizer:
-    """Normalise le texte en utilisant les librairies disponibles."""
+class ConceptResolver:
+    """Résout les verbes en concepts en utilisant VerbMemory."""
     
-    def __init__(self, errors: ErrorsMemory, libs: ExternalLibraries):
-        self.errors = errors
-        self.libs = libs
+    def __init__(self, verb_memory: VerbMemory):
+        self.verb_memory = verb_memory
+        self.pending_clarifications: List[Dict] = []
     
-    def normalize(self, text: str, speaker: str = None) -> Tuple[str, List[Dict]]:
-        """
-        Normalise le texte : corrections orthographiques, contractions.
-        """
-        words = text.split()
-        corrected_words = []
-        corrections = []
-        
-        for word in words:
-            # 1. Vérifier dans le dictionnaire des erreurs
-            correction = self.errors.get(word)
-            if correction:
-                corrected, conf = correction
-                corrected_words.append(corrected)
-                corrections.append({
-                    "original": word,
-                    "corrected": corrected,
-                    "confidence": conf,
-                    "source": "errors_db"
-                })
-                continue
-            
-            # 2. Contractions courantes
-            expanded = self._expand_contractions(word)
-            if expanded != word:
-                corrected_words.append(expanded)
-                corrections.append({
-                    "original": word,
-                    "corrected": expanded,
-                    "confidence": 0.9,
-                    "source": "contraction"
-                })
-                continue
-            
-            # 3. Correction orthographique avec Hunspell si disponible
-            if self.libs.have_hunspell and self.libs.spellchecker:
-                if not self.libs.spellchecker.spell(word):
-                    suggestions = self.libs.spellchecker.suggest(word)
-                    if suggestions:
-                        corrected_words.append(suggestions[0])
-                        corrections.append({
-                            "original": word,
-                            "corrected": suggestions[0],
-                            "confidence": 0.7,
-                            "source": "hunspell"
-                        })
-                        continue
-            
-            corrected_words.append(word)
-        
-        return " ".join(corrected_words), corrections
+    def resolve(self, verb: str, context: Dict) -> Tuple[Concept, float, Optional[str]]:
+        """Résout un verbe en concept."""
+        return self.verb_memory.resolve(verb)
     
-    def _expand_contractions(self, word: str) -> str:
-        """Expansion des contractions courantes."""
-        contractions = {
-            "j'": "je",
-            "t'": "tu",
-            "m'": "me",
-            "s'": "se",
-            "c'": "ce",
-            "l'": "le",
-            "d'": "de",
-            "qu'": "que",
-            "n'": "ne"
-        }
+    def handle_unknown(self, verb: str, context: Dict) -> Optional[StructuredIntent]:
+        """Gère un verbe inconnu en proposant une clarification."""
+        # Chercher des verbes similaires
+        similar = []
+        for v, entry in self.verb_memory.verbs.items():
+            if len(v) > 2 and (v in verb or verb in v):
+                similar.append((v, entry.concept))
         
-        for contr, exp in contractions.items():
-            if word.startswith(contr):
-                return exp + " " + word[len(contr):]
-        
-        return word
-
-# ============================================================
-# DÉTECTEUR D'INTENTS
-# ============================================================
-
-class IntentDetector:
-    """Détecte les intents à partir du texte normalisé."""
-    
-    def __init__(self, libs: ExternalLibraries):
-        self.libs = libs
-        
-        # Patterns chargés depuis un fichier (pas de hard coding)
-        self.patterns = self._load_patterns()
-    
-    def _load_patterns(self) -> Dict:
-        """Charge les patterns depuis un fichier."""
-        # En vrai, charger depuis un fichier JSON
-        # Ici version minimale pour l'exemple
-        return {
-            "question": {
-                "time": [r"heure", r"temps", r"quelle heure"],
-                "person": [r"qui", r"comment s'appelle"],
-                "place": [r"où", r"dans quel endroit"]
-            },
-            "plan": {
-                "meal": [r"resto", r"restaurant", r"manger", r"dîner"],
-                "meeting": [r"rendez-vous", r"voir", r"retrouver"]
-            },
-            "action": {
-                "device": [r"allume", r"éteint", r"ouvre", r"ferme"]
-            }
-        }
-    
-    def detect(self, text: str, attributes: Dict) -> List[StructuredIntent]:
-        """
-        Détecte tous les intents présents.
-        """
-        intents = []
-        text_lower = text.lower()
-        
-        # Questions
-        if text_lower.endswith("?"):
-            if any(w in text_lower for w in ["heure", "temps"]):
-                intent = StructuredIntent(
-                    intent="question",
-                    sub_intent="time",
-                    type=IntentType.QUESTION,
-                    attributes={},
-                    confidence=0.9,
-                    source="detector"
-                )
-                intents.append(intent)
-        
-        # Plans
-        if any(w in text_lower for w in ["resto", "restaurant", "manger"]):
-            intent = StructuredIntent(
-                intent="plan",
-                sub_intent="meal",
-                type=IntentType.INFORMATION,
-                attributes=attributes,
-                confidence=0.85,
-                source="detector"
+        if similar:
+            # Proposer le plus similaire
+            best = similar[0]
+            return StructuredIntent(
+                id=f"clar_{uuid.uuid4().hex[:8]}",
+                timestamp=time.time(),
+                conversation_id=context.get("conversation_id", ""),
+                speaker="system",
+                semantic={
+                    "intent": "clarification",
+                    "sub_intent": "verb_clarification",
+                    "type": IntentType.CLARIFICATION,
+                    "confidence": 0.8
+                },
+                attributes={
+                    "verb": Attribute(
+                        type="string",
+                        value=verb,
+                        source=SourceInfo(type=SourceWeight.OBSERVATION)
+                    ),
+                    "suggestion": Attribute(
+                        type="string",
+                        value=best[0],
+                        source=SourceInfo(type=SourceWeight.OBSERVATION)
+                    ),
+                    "concept": Attribute(
+                        type="string",
+                        value=best[1].value,
+                        source=SourceInfo(type=SourceWeight.OBSERVATION)
+                    )
+                }
             )
-            intents.append(intent)
         
-        # Actions
-        for action in ["allume", "éteint"]:
-            if action in text_lower:
-                intent = StructuredIntent(
-                    intent="action",
-                    sub_intent="device",
-                    type=IntentType.ACTION,
-                    attributes=attributes,
-                    confidence=0.9,
-                    source="detector"
-                )
-                intents.append(intent)
-        
-        return intents
+        return None
 
 # ============================================================
-# CURIOSITÉ ENGINE
+# CURIOSITY ENGINE
 # ============================================================
 
 class CuriosityEngine:
-    """Gère les connaissances manquantes selon le Gem."""
+    """Gère les connaissances manquantes."""
     
-    def __init__(self, gem: Gem):
+    def __init__(self, gem: Gem, concept_resolver: ConceptResolver):
         self.gem = gem
+        self.concept_resolver = concept_resolver
         self.pending: List[Dict] = []
     
-    def check_intents(self, intents: List[StructuredIntent]) -> List[StructuredIntent]:
-        """
-        Vérifie les intents et ajoute des clarifications si nécessaire.
-        """
-        results = list(intents)
+    def check_intent(self, intent: StructuredIntent) -> List[StructuredIntent]:
+        """Vérifie un intent et retourne d'éventuelles clarifications."""
+        clarifications = []
         
-        for intent in intents:
-            # Vérifier les personnes inconnues
-            if "person" in intent.attributes:
-                attr = intent.attributes["person"]
-                if not attr.metadata.get("known", False):
-                    # La curiosité pour les personnes est-elle assez élevée ?
-                    if self.gem.curiosite_personnes > self.gem.seuil_curiosite:
-                        results.append(StructuredIntent(
-                            intent="ask_clarification",
-                            sub_intent="unknown_person",
-                            type=IntentType.CLARIFICATION,
-                            attributes={"person": attr},
-                            confidence=0.9,
-                            source="curiosity"
-                        ))
-            
-            # Vérifier les mots inconnus
-            if "word" in intent.attributes and self.gem.curiosite_mots > self.gem.seuil_curiosite:
-                # etc.
-                pass
+        # Vérifier les verbes inconnus
+        if "verb" in intent.analysis:
+            verb_info = intent.analysis["verb"]
+            if verb_info.get("concept") == Concept.UNKNOWN.value:
+                if self.gem.curiosite_verbes > self.gem.seuil_curiosite:
+                    clarif = self.concept_resolver.handle_unknown(
+                        verb_info.get("lemma", ""),
+                        {"conversation_id": intent.conversation_id}
+                    )
+                    if clarif:
+                        clarifications.append(clarif)
         
-        return results
+        # Vérifier les mots inconnus (à implémenter)
+        # Vérifier les personnes inconnues (à implémenter)
+        
+        return clarifications
 
 # ============================================================
-# ROUTER PRINCIPAL
+# MOTEUR D'INFÉRENCE
 # ============================================================
 
-class Router:
-    """Route les intents vers les bonnes mémoires."""
+class InferenceEngine:
+    """Moteur qui interroge les mémoires pour répondre."""
     
-    def __init__(self, words: WordsMemory, errors: ErrorsMemory,
-                 temporal: TemporalMemory, episodic: EpisodicMemory,
-                 social: SocialMemory, narrative: NarrativeMemory,
-                 romans: RomanMemory, educational: EducationalMemory,
-                 gem: Gem):
-        self.words = words
-        self.errors = errors
-        self.temporal = temporal
-        self.episodic = episodic
-        self.social = social
-        self.narrative = narrative
-        self.romans = romans
-        self.educational = educational
-        self.gem = gem
+    def __init__(self, memories: Dict[str, MemoryInterface]):
+        self.memories = memories
     
-    def route(self, intents: List[StructuredIntent]) -> List[StructuredIntent]:
-        """
-        Met à jour les mémoires en fonction des intents.
-        """
-        responses = []
+    def answer(self, intent: StructuredIntent) -> Optional[StructuredIntent]:
+        """Produit une réponse à un intent."""
         
-        for intent in intents:
-            if intent.type == IntentType.INFORMATION:
-                response = self._handle_information(intent)
-                if response:
-                    responses.append(response)
+        if intent.semantic.get("type") != IntentType.QUESTION:
+            return None
         
-        return responses
-    
-    def _handle_information(self, intent: StructuredIntent) -> Optional[StructuredIntent]:
-        """Traite un intent d'information."""
+        sub_intent = intent.semantic.get("sub_intent")
         
-        if intent.sub_intent == "new_word":
-            # Ajouter un mot
-            word = intent.attributes.get("word")
-            if word:
-                source = intent.attributes.get("source", Attribute(
-                    type="source",
-                    value=SourceWeight.EDUCATIVE
-                ))
-                self.words.add(word.value, source=source.value)
-                
-                return StructuredIntent(
-                    intent="acknowledge",
-                    sub_intent="word_added",
-                    type=IntentType.REPONSE,
-                    attributes={"word": word},
-                    confidence=0.95,
-                    source="router"
+        # Construire les requêtes en fonction du type de question
+        if sub_intent == "time":
+            # Réponse directe (pas besoin de mémoires)
+            now = datetime.now()
+            return StructuredIntent(
+                id=f"resp_{uuid.uuid4().hex[:8]}",
+                timestamp=time.time(),
+                conversation_id=intent.conversation_id,
+                speaker="system",
+                semantic={
+                    "intent": "answer",
+                    "sub_intent": "time",
+                    "type": IntentType.REPONSE,
+                    "confidence": 1.0
+                },
+                attributes={
+                    "time": Attribute(
+                        type="datetime",
+                        value=now.isoformat(),
+                        source=SourceInfo(type=SourceWeight.OBSERVATION)
+                    ),
+                    "hour": Attribute(
+                        type="number",
+                        value=now.hour,
+                        source=SourceInfo(type=SourceWeight.OBSERVATION)
+                    ),
+                    "minute": Attribute(
+                        type="number",
+                        value=now.minute,
+                        source=SourceInfo(type=SourceWeight.OBSERVATION)
+                    )
+                },
+                in_response_to=intent.id
+            )
+        
+        elif sub_intent == "person":
+            # Chercher dans SocialMemory
+            person_name = intent.attributes.get("person", {}).value if "person" in intent.attributes else None
+            if person_name:
+                result = self.memories["social"].query(
+                    "person",
+                    {"name": person_name},
+                    {}
                 )
+                if result.get("person"):
+                    return StructuredIntent(
+                        id=f"resp_{uuid.uuid4().hex[:8]}",
+                        timestamp=time.time(),
+                        conversation_id=intent.conversation_id,
+                        speaker="system",
+                        semantic={
+                            "intent": "answer",
+                            "sub_intent": "person_info",
+                            "type": IntentType.REPONSE,
+                            "confidence": result["confidence"]
+                        },
+                        attributes={
+                            "person": Attribute(
+                                type="person",
+                                value=result["person"],
+                                source=SourceInfo(type=SourceWeight.OBSERVATION)
+                            )
+                        },
+                        in_response_to=intent.id
+                    )
         
-        elif intent.sub_intent == "correction":
-            # Ajouter une correction
-            wrong = intent.attributes.get("wrong")
-            correct = intent.attributes.get("correct")
-            if wrong and correct:
-                source = intent.attributes.get("source", Attribute(
-                    type="source",
-                    value=SourceWeight.SELF
-                ))
-                self.errors.add(wrong.value, correct.value, source=source.value)
-        
-        elif intent.sub_intent == "new_person":
-            # Ajouter une personne
-            name = intent.attributes.get("name")
-            if name:
-                source = intent.attributes.get("source", Attribute(
-                    type="source",
-                    value=SourceWeight.SELF
-                ))
-                person = self.social.add_person(name.value, source=source.value)
-                
-                return StructuredIntent(
-                    intent="acknowledge",
-                    sub_intent="person_added",
-                    type=IntentType.REPONSE,
-                    attributes={
-                        "person_id": Attribute(type="string", value=person.id),
-                        "name": name
-                    },
-                    confidence=0.95,
-                    source="router"
+        elif sub_intent == "fact":
+            # Chercher dans EpisodicMemory par concept
+            concept = intent.analysis.get("verb", {}).get("concept")
+            if concept:
+                result = self.memories["episodic"].query(
+                    "by_concept",
+                    {"concept": concept, "days": 30},
+                    {}
                 )
-        
-        elif intent.sub_intent == "new_fact":
-            # Ajouter un fait épisodique
-            subject = intent.attributes.get("subject")
-            predicate = intent.attributes.get("predicate")
-            object_val = intent.attributes.get("object")
-            if subject and predicate and object_val:
-                source = intent.attributes.get("source", Attribute(
-                    type="source",
-                    value=SourceWeight.OBSERVATION
-                ))
-                self.episodic.add(
-                    subject=subject.value,
-                    predicate=predicate.value,
-                    object=object_val.value,
-                    context={},
-                    source=source.value
-                )
-        
-        elif intent.sub_intent == "new_roman":
-            # Ajouter un roman
-            title = intent.attributes.get("title")
-            author = intent.attributes.get("author")
-            if title and author:
-                source = intent.attributes.get("source", Attribute(
-                    type="source",
-                    value=SourceWeight.FICTION
-                ))
-                self.romans.add(
-                    title=title.value,
-                    author=author.value,
-                    genre=intent.attributes.get("genre", Attribute(type="string", value="roman")).value,
-                    characters=intent.attributes.get("characters", Attribute(type="list", value=[])).value,
-                    summary=intent.attributes.get("summary", Attribute(type="string", value="")).value,
-                    themes=intent.attributes.get("themes", Attribute(type="list", value=[])).value,
-                    source=source.value
-                )
-        
-        elif intent.sub_intent == "new_knowledge":
-            # Ajouter une connaissance éducative
-            title = intent.attributes.get("title")
-            if title:
-                source = intent.attributes.get("source", Attribute(
-                    type="source",
-                    value=SourceWeight.EDUCATIVE
-                ))
-                self.educational.add(
-                    title=title.value,
-                    author=intent.attributes.get("author", Attribute(type="string", value="")).value,
-                    period=intent.attributes.get("period", Attribute(type="string", value="contemporain")).value,
-                    genre=intent.attributes.get("genre", Attribute(type="string", value="essai")).value,
-                    importance=intent.attributes.get("importance", Attribute(type="number", value=0.8)).value,
-                    content=intent.attributes.get("content", Attribute(type="object", value={})).value,
-                    source=source.value
-                )
+                if result.get("events"):
+                    return StructuredIntent(
+                        id=f"resp_{uuid.uuid4().hex[:8]}",
+                        timestamp=time.time(),
+                        conversation_id=intent.conversation_id,
+                        speaker="system",
+                        semantic={
+                            "intent": "answer",
+                            "sub_intent": "facts",
+                            "type": IntentType.REPONSE,
+                            "confidence": 0.8
+                        },
+                        attributes={
+                            "events": Attribute(
+                                type="list",
+                                value=result["events"],
+                                source=SourceInfo(type=SourceWeight.OBSERVATION)
+                            )
+                        },
+                        in_response_to=intent.id
+                    )
         
         return None
 
@@ -1923,7 +1860,16 @@ class Router:
 
 class CognitionCore:
     """
-    Cœur cognitif principal - point d'entrée unique.
+    Cœur cognitif principal - point d'entrée unique du système.
+    
+    Utilisation:
+        core = CognitionCore(data_path="./data", gem_path="./gem.json")
+        core.start()
+        
+        intent = core.process_text("demain midi, je vais au restaurant avec Paul")
+        # intent est un StructuredIntent prêt pour le pipeline d'enrichissement
+        
+        response = core.answer(intent)  # Optionnel, si on veut répondre directement
     """
     
     def __init__(self, data_path: Path, gem_path: Path):
@@ -1934,10 +1880,7 @@ class CognitionCore:
         logger.info(f"📖 Chargement du Gem depuis {gem_path}")
         self.gem = Gem.from_file(gem_path)
         
-        # Initialiser les librairies externes
-        self.libs = ExternalLibraries()
-        
-        # Chemins
+        # Initialiser les chemins
         self.files_path = self.data_path / "files"
         self.db_path = self.data_path / "db"
         self.narrative_path = self.data_path / "narrative"
@@ -1950,140 +1893,175 @@ class CognitionCore:
         self.storage = CompressedStorage(self.files_path)
         
         # Initialiser toutes les mémoires
-        self.words = WordsMemory(self.storage, self.gem)
-        self.errors = ErrorsMemory(self.db_path / "errors.db", self.gem)
-        self.temporal = TemporalMemory(self.storage, self.libs)
-        self.episodic = EpisodicMemory(self.db_path / "episodic.db", self.gem)
+        self.verbs = VerbMemory(self.storage, self.gem)
+        self.words = WordMemory(self.storage, self.gem)
+        self.errors = ErrorMemory(self.db_path / "errors.db", self.gem)
+        self.temporal = TemporalMemory(self.storage)
         self.social = SocialMemory(self.db_path / "social.db", self.gem)
-        self.narrative = NarrativeMemory(self.narrative_path, self.storage)
+        self.episodic = EpisodicMemory(self.db_path / "episodic.db", self.gem)
         self.romans = RomanMemory(self.storage, self.gem)
         self.educational = EducationalMemory(self.storage)
+        self.narrative = NarrativeMemory(self.narrative_path, self.storage)
         
-        # Composants de traitement
-        self.normalizer = TextNormalizer(self.errors, self.libs)
-        self.detector = IntentDetector(self.libs)
-        self.curiosity = CuriosityEngine(self.gem)
-        self.router = Router(
-            self.words, self.errors, self.temporal,
-            self.episodic, self.social, self.narrative,
-            self.romans, self.educational, self.gem
-        )
+        # Registry des mémoires pour l'inférence
+        self.memories = {
+            "verbs": self.verbs,
+            "words": self.words,
+            "errors": self.errors,
+            "temporal": self.temporal,
+            "social": self.social,
+            "episodic": self.episodic,
+            "romans": self.romans,
+            "educational": self.educational,
+            "narrative": self.narrative
+        }
         
-        # État
-        self.conversation_id = None
-        self.running = True
+        # Composants
+        self.concept_resolver = ConceptResolver(self.verbs)
+        self.curiosity = CuriosityEngine(self.gem, self.concept_resolver)
+        self.inference = InferenceEngine(self.memories)
+        
+        # Contexte
+        self.current_conversation: Optional[ContextFrame] = None
+        self.system_context = SystemContext()
+        
+        # Thread de maintenance nocturne
+        self._running = False
+        self._maintenance_thread = None
         
         logger.info(f"✅ CognitionCore initialisé - Gem: {self.gem.nom} v{self.gem.version}")
     
-    def process(self, text: str, speaker: str = None) -> MultiIntent:
-        """
-        Traite une entrée texte et retourne des intents structurés.
-        """
-        logger.debug(f"Traitement: {text}")
-        
-        # 1. Normalisation (correction des fautes)
-        normalized_text, corrections = self.normalizer.normalize(text, speaker)
-        
-        # 2. Extraction des attributs basiques
-        attributes = self._extract_attributes(normalized_text)
-        
-        # 3. Détection des intents
-        intents = self.detector.detect(normalized_text, attributes)
-        
-        # 4. Ajouter les corrections comme meta
-        for intent in intents:
-            intent.attributes["_corrections"] = Attribute(
-                type="list",
-                value=corrections,
-                confidence=0.9
-            )
-        
-        # 5. Vérification par la curiosité
-        intents = self.curiosity.check_intents(intents)
-        
-        # 6. Router vers les mémoires
-        responses = self.router.route(intents)
-        
-        # 7. Ajouter au livre de vie
-        self.narrative.add_event({
-            "type": "user_input",
-            "text": text,
-            "normalized": normalized_text,
-            "speaker": speaker,
-            "intents": [i.to_dict() for i in intents]
-        })
-        
-        # 8. Résultat final
-        all_intents = intents + responses
-        
-        return MultiIntent(
-            intents=all_intents,
-            original_text=text,
-            timestamp=time.time()
+    def start(self):
+        """Démarre le thread de maintenance nocturne."""
+        self._running = True
+        self._maintenance_thread = threading.Thread(
+            target=self._nightly_loop,
+            name="nightly-maintenance",
+            daemon=True
         )
+        self._maintenance_thread.start()
+        logger.info("✅ CognitionCore démarré")
     
-    def _extract_attributes(self, text: str) -> Dict[str, Attribute]:
-        """Extraction basique d'attributs."""
-        attributes = {}
-        
-        # Personnes (simplifié)
-        person_match = re.search(r'(?:avec|et|pour) (\w+)', text)
-        if person_match:
-            name = person_match.group(1)
-            person = self.social.find_by_name(name)
-            attributes["person"] = Attribute(
-                type="person",
-                value=name,
-                confidence=0.8,
-                metadata={"known": person is not None}
-            )
-        
-        # Lieux
-        loc_match = re.search(r'(?:au|à la|dans) (\w+)', text)
-        if loc_match:
-            attributes["location"] = Attribute(
-                type="place",
-                value=loc_match.group(1),
-                confidence=0.7
-            )
-        
-        # Temps
-        time_match = re.search(r'(demain|aujourd\'hui|ce soir|maintenant)', text)
-        if time_match:
-            resolved = self.temporal.resolve(time_match.group(1))
-            attributes["temporal"] = Attribute(
-                type="datetime",
-                value=time_match.group(1),
-                normalized=resolved.get("iso") if resolved.get("success") else None,
-                confidence=resolved.get("confidence", 0.7)
-            )
-        
-        return attributes
+    def stop(self):
+        """Arrête le système."""
+        self._running = False
+        if self._maintenance_thread:
+            self._maintenance_thread.join(timeout=5)
+        logger.info("✅ CognitionCore arrêté")
+    
+    def _nightly_loop(self):
+        """Boucle de maintenance nocturne."""
+        while self._running:
+            now = datetime.now()
+            if now.hour == CONFIG["nightly_hour"] and now.minute < 5:
+                logger.info("🌙 Début de la maintenance nocturne...")
+                self.nightly_maintenance()
+                time.sleep(3600)  # Attendre 1h pour ne pas refaire tout de suite
+            time.sleep(60)  # Vérifier chaque minute
     
     def nightly_maintenance(self):
-        """Tâches de maintenance nocturne."""
-        logger.info("🌙 Maintenance nocturne...")
+        """Cristallisation nocturne de toutes les connaissances."""
+        logger.info("🌙 Cristallisation nocturne...")
         
-        # 1. Nettoyer les erreurs
-        errors_deleted = self.errors.cleanup()
+        results = {}
+        for name, memory in self.memories.items():
+            try:
+                res = memory.consolidate()
+                results[name] = res
+                logger.info(f"  ✓ {name}: {res}")
+            except Exception as e:
+                logger.error(f"  ✗ {name}: {e}")
         
-        # 2. Nettoyer l'épisodique
-        episodic_deleted = self.episodic.cleanup()
+        # Archiver le narratif
+        self.narrative.consolidate()
         
-        # 3. Nettoyer le social
-        social_deleted = self.social.cleanup()
+        logger.info(f"🌙 Cristallisation terminée: {results}")
+        return results
+    
+    def process_text(self, text: str, speaker: str = None) -> StructuredIntent:
+        """
+        Traite un texte brut et retourne un intent structuré.
+        C'est le point d'entrée principal.
+        """
+        # Créer ou récupérer le contexte de conversation
+        if not self.current_conversation or self.current_conversation.is_expired():
+            self.current_conversation = ContextFrame(
+                conversation_id=f"conv_{uuid.uuid4().hex[:8]}"
+            )
         
-        # 4. Appliquer le refroidissement des romans
-        self.romans.apply_cooling()
+        # Mettre à jour le contexte système
+        self.system_context.refresh()
         
-        # 5. Archiver le mois dernier
-        now = datetime.now()
-        last_month = now.month - 1 if now.month > 1 else 12
-        last_year = now.year if now.month > 1 else now.year - 1
-        self.narrative.archive_month(last_year, last_month)
+        # Créer l'intent de base
+        intent_id = f"intent_{uuid.uuid4().hex[:8]}"
+        intent = StructuredIntent(
+            id=intent_id,
+            timestamp=time.time(),
+            conversation_id=self.current_conversation.conversation_id,
+            speaker=speaker or "unknown",
+            semantic={
+                "intent": "unknown",  # Sera enrichi par le pipeline
+                "sub_intent": "unknown",
+                "type": IntentType.INFORMATION,
+                "confidence": 0.5
+            },
+            attributes={
+                "text": Attribute(
+                    type="string",
+                    value=text,
+                    source=SourceInfo(type=SourceWeight.OBSERVATION, speaker=speaker)
+                )
+            },
+            context={
+                "conversation": asdict(self.current_conversation),
+                "system": {
+                    "now": self.system_context.now.isoformat(),
+                    "here": self.system_context.here
+                }
+            }
+        )
         
-        logger.info(f"🌙 Maintenance terminée: {errors_deleted} erreurs, "
-                   f"{episodic_deleted} épisodiques, {social_deleted} sociaux")
+        # Vérifier les corrections d'erreurs
+        for word in text.split():
+            correction = self.errors.get(word)
+            if correction:
+                correct, conf, concept = correction
+                intent.attributes[f"correction_{word}"] = Attribute(
+                    type="correction",
+                    value={"original": word, "corrected": correct},
+                    source=SourceInfo(type=SourceWeight.EDUCATIVE, confidence=conf)
+                )
+        
+        # Mettre à jour le contexte
+        self.current_conversation.update(
+            who=speaker,
+            history=[intent_id]
+        )
+        
+        logger.info(f"📥 Intent créé: {intent_id}")
+        return intent
+    
+    def answer(self, intent: StructuredIntent) -> Optional[StructuredIntent]:
+        """
+        Produit une réponse à un intent.
+        Retourne un intent de réponse ou None.
+        """
+        # Vérifier les clarifications nécessaires
+        clarifications = self.curiosity.check_intent(intent)
+        if clarifications:
+            # Retourner la première clarification
+            return clarifications[0]
+        
+        # Sinon, essayer de répondre
+        return self.inference.answer(intent)
+    
+    def update_memories(self, intent: StructuredIntent):
+        """Met à jour toutes les mémoires à partir d'un intent."""
+        for name, memory in self.memories.items():
+            try:
+                memory.update(intent)
+            except Exception as e:
+                logger.error(f"Erreur mise à jour {name}: {e}")
     
     def get_stats(self) -> Dict:
         """Statistiques du système."""
@@ -2094,29 +2072,19 @@ class CognitionCore:
                 "naissance": self.gem.date_naissance
             },
             "memories": {
+                "verbs": len(self.verbs.verbs),
                 "words": len(self.words.words),
-                "errors": "voir DB",
-                "episodic": "voir DB",
-                "social": "voir DB",
                 "romans": len(self.romans.romans),
-                "educational": len(self.educational.works),
-                "narrative_current": self.narrative.current_book.book_id if self.narrative.current_book else None
-            },
-            "libraries": {
-                "spacy": self.libs.have_spacy,
-                "stanza": self.libs.have_stanza,
-                "dateparser": self.libs.have_dateparser,
-                "hunspell": self.libs.have_hunspell,
-                "pattern": self.libs.have_pattern
+                "educational": len(self.educational.works)
             }
         }
 
 # ============================================================
-# EXEMPLE DE FICHIER GEM
+# FICHIERS DE CONFIGURATION EXEMPLES
 # ============================================================
 
 """
-Exemple de fichier gem.json:
+Exemple gem.json:
 {
     "gem": {
         "identifiant": "shirka_001",
@@ -2150,16 +2118,19 @@ Exemple de fichier gem.json:
 """
 
 # ============================================================
-# EXEMPLE D'UTILISATION
+# POINT D'ENTRÉE POUR TESTS
 # ============================================================
 
-def demo():
-    """Démonstration du système."""
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s.%(msecs)03d %(levelname)-8s [%(name)s] %(message)s",
+        datefmt="%H:%M:%S"
+    )
     
-    # Initialiser avec un fichier Gem
+    # Créer un gem exemple si nécessaire
     gem_path = Path("./gem.json")
     if not gem_path.exists():
-        # Créer un exemple si le fichier n'existe pas
         example_gem = {
             "gem": {
                 "identifiant": "shirka_demo",
@@ -2176,10 +2147,7 @@ def demo():
                 "curiosite_lieux": 0.8,
                 "curiosite_faits": 0.7,
                 "affinites_litterature": {
-                    "roman": 0.8,
-                    "poesie": 0.4,
-                    "theatre": 0.6,
-                    "essai": 0.7
+                    "roman": 0.8, "poesie": 0.4, "theatre": 0.6, "essai": 0.7
                 },
                 "duree_memoire_litterature": 30,
                 "duree_memoire_episodique": 90,
@@ -2192,34 +2160,26 @@ def demo():
         }
         with open(gem_path, 'w', encoding='utf-8') as f:
             json.dump(example_gem, f, indent=2)
-        logger.info(f"✅ Fichier Gem exemple créé: {gem_path}")
+        print(f"✅ Fichier Gem exemple créé: {gem_path}")
     
-    # Créer le core
+    # Initialiser le core
     core = CognitionCore(Path("./data"), gem_path)
+    core.start()
     
-    # Tester avec des phrases
-    test_phrases = [
-        "demain midi, je vais au restaurant avec Paul",
-        "quelle heure est-il ?",
-        "Je viens de lire Le Petit Prince",
-        "Paul est mon ami"
-    ]
+    # Test simple
+    test_phrase = "demain midi, je vais au restaurant avec Paul"
+    print(f"\n📥 Test: {test_phrase}")
     
-    for phrase in test_phrases:
-        print(f"\n📥 Entrée: {phrase}")
-        result = core.process(phrase)
-        print(f"📤 Sortie: {json.dumps(result.to_dict(), indent=2, ensure_ascii=False)}")
+    intent = core.process_text(test_phrase, speaker="user_001")
+    print(f"📤 Intent: {json.dumps(intent.to_dict(), indent=2, ensure_ascii=False)[:500]}...")
+    
+    # Simuler une réponse
+    response = core.answer(intent)
+    if response:
+        print(f"📢 Réponse: {json.dumps(response.to_dict(), indent=2, ensure_ascii=False)}")
     
     # Statistiques
-    print(f"\n📊 Stats: {json.dumps(core.get_stats(), indent=2, ensure_ascii=False)}")
+    print(f"\n📊 Stats: {json.dumps(core.get_stats(), indent=2)}")
     
-    # Simuler une maintenance nocturne
-    core.nightly_maintenance()
-
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s.%(msecs)03d %(levelname)-8s [%(name)s] %(message)s",
-        datefmt="%H:%M:%S"
-    )
-    demo()
+    # Arrêt
+    core.stop()
