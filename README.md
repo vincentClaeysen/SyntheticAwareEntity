@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="assets/logo-20260217.png" width="150" alt="SAE logo">
+  <img src="assets/logo-20260217.png" width="150" alt="ASE logo">
 </p>
 
-# SAE - Synthetic Aware Entity
+# ASE - Aware Synthetic Entity
 
 > Research project exploring the minimal conditions required for the emergence of a synthetic self.
 
