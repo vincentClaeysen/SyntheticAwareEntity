@@ -202,6 +202,7 @@ def thread_acquisition(device: dai.Device,
 
     dernier_af     = datetime.now()
     lenspos_actuel = 120
+    lenspos_cible  = 120   # preset envoyé — on attend que la frame le confirme
 
     EMA_ALPHA = 0.25 if IS_PI else 0.35   # plus lissé sur Pi
     depth_ema = None
@@ -214,10 +215,19 @@ def thread_acquisition(device: dai.Device,
         if in_rgb is None or in_depth is None or in_disp is None:
             continue
 
-        frame_bgr = in_rgb.getCvFrame()
-        depth_raw = in_depth.getFrame()                                        # uint16, mm
-        disp_raw  = in_disp.getFrame().astype(np.uint8) if USE_WLS else None
-        ts        = datetime.now()
+        frame_bgr   = in_rgb.getCvFrame()
+        depth_raw   = in_depth.getFrame()                                        # uint16, mm
+        disp_raw    = in_disp.getFrame().astype(np.uint8) if USE_WLS else None
+        ts          = datetime.now()
+
+        # Vérification focus hardware : on ignore la frame si la lentille
+        # n'a pas encore atteint la position cible.
+        # getLensPosition() est une métadonnée du capteur RGB, indépendante de l'IMU.
+        # Tolérance ±2 : oscillation normale de la lentille motorisée.
+        # Retourne -1 si non disponible → on laisse passer.
+        lenspos_reel = in_rgb.getLensPosition()
+        if lenspos_reel != -1 and abs(lenspos_reel - lenspos_cible) > 2:
+            continue
 
         # Filtrage depth
         frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
@@ -245,9 +255,9 @@ def thread_acquisition(device: dai.Device,
                 ctrl.setManualFocus(nouveau_lp)
                 q_ctrl.send(ctrl)
                 lenspos_actuel = nouveau_lp
+                lenspos_cible  = nouveau_lp   # le filtre hardware prend le relais
+                depth_ema      = None          # reset EMA : frames floues exclues
             dernier_af = ts
-
-        # Push (drop de la frame la plus ancienne si retard)
         if frame_queue.full():
             try:
                 frame_queue.get_nowait()
