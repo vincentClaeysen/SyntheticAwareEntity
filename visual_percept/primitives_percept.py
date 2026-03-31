@@ -52,7 +52,7 @@ print(f"[CAPTEUR] {'OAK-D Lite' if USE_OAKD else 'Webcam'}")
 # ─────────────────────────────────────────────────────────────
 #  PARAMÈTRES
 # ─────────────────────────────────────────────────────────────
-W, H          = 640, 400 if USE_OAKD else 640, 480
+W, H          = 640, 400          # Résolution unique pour tous
 FPS_ACQ       = 20
 QUEUE_MAX     = 2
 PRECISION     = 0.6
@@ -252,12 +252,12 @@ def thread_acquisition_oak(device, frame_queue, stop_event):
 
 
 # ─────────────────────────────────────────────────────────────
-#  THREAD ACQUISITION WEBCAM
+#  THREAD ACQUISITION WEBCAM (avec clipping centré 640x400)
 # ─────────────────────────────────────────────────────────────
 def thread_acquisition_webcam(frame_queue, stop_event):
     cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, W)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, H)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     cap.set(cv2.CAP_PROP_FPS, FPS_ACQ)
 
     if not cap.isOpened():
@@ -265,14 +265,23 @@ def thread_acquisition_webcam(frame_queue, stop_event):
         stop_event.set()
         return
 
-    print(f"[WEBCAM] {W}x{H} @ {FPS_ACQ}fps")
+    print(f"[WEBCAM] 640x480 → clipping centré 640x400")
 
     while not stop_event.is_set():
         ret, frame = cap.read()
         if not ret:
             continue
-        if frame.shape[:2] != (H, W):
+
+        # Clipping centré pour obtenir 640x400
+        h, w = frame.shape[:2]
+        if h >= 400:
+            # Prendre la partie centrale
+            debut_y = (h - 400) // 2
+            frame = frame[debut_y:debut_y + 400, :]
+        else:
+            # Si la webcam donne une hauteur < 400, on redimensionne
             frame = cv2.resize(frame, (W, H))
+
         if frame_queue.full():
             try:
                 frame_queue.get_nowait()
