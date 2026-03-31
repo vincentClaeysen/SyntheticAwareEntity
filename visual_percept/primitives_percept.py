@@ -15,7 +15,11 @@ from datetime import datetime
 
 import cv2
 import numpy as np
-import depthai as dai
+try:
+    import depthai as dai
+    DEPTHAI_DISPONIBLE = True
+except ImportError:
+    DEPTHAI_DISPONIBLE = False
 
 # ─────────────────────────────────────────────────────────────
 #  DÉTECTION PLATEFORME
@@ -43,6 +47,18 @@ if IS_PI:
     print("[PLATEFORME] Raspberry Pi détecté — WLS désactivé, mode allégé actif")
 else:
     print(f"[PLATEFORME] PC/autre — WLS={'ON' if USE_WLS else 'OFF (ximgproc absent)'}")
+
+def _detecter_oakd() -> bool:
+    """Tente de trouver un device OAK-D connecté."""
+    if not DEPTHAI_DISPONIBLE:
+        return False
+    try:
+        return len(dai.Device.getAllAvailableDevices()) > 0
+    except Exception:
+        return False
+
+USE_OAKD = _detecter_oakd()
+print(f"[CAPTEUR] {'OAK-D Lite détecté' if USE_OAKD else 'Pas d OAK-D — fallback webcam'}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -468,7 +484,7 @@ def thread_traitement(frame_queue: queue.Queue,
         except queue.Empty:
             continue
 
-        z_cible = distance_mediane_centrale(depth_map)
+        z_cible = distance_mediane_centrale(depth_map) if depth_map is not None else 0.0
 
         _, edges, objets, scene = vision_primitive_complete(
             frame_bgr,
@@ -487,49 +503,114 @@ def thread_traitement(frame_queue: queue.Queue,
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, couleur, 1)
 
         latence_ms = (datetime.now() - ts).total_seconds() * 1000
+        z_str = f"z:{z_cible:.0f}mm" if depth_map is not None else "z:N/A"
         hud = (f"lum:{scene['lum_globale']:.0f}  "
                f"std:{scene['std_globale']:.0f}  "
-               f"z:{z_cible:.0f}mm  "
+               f"{z_str}  "
                f"lat:{latence_ms:.0f}ms  "
                f"{ts.strftime('%H:%M:%S.%f')[:-3]}")
         cv2.putText(affichage, hud, (8, 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
 
-        # Depth colorisée en incrustation (coin bas-droit)
-        depth_vis   = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
-        depth_col   = cv2.applyColorMap(depth_vis, cv2.COLORMAP_MAGMA)
-        dh, dw      = H // 4, W // 4
-        depth_small = cv2.resize(depth_col, (dw, dh))
-        affichage[H - dh:H, W - dw:W] = depth_small
+        # Depth colorisée en incrustation (coin bas-droit) — OAK-D seulement
+        if depth_map is not None:
+            depth_vis   = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+            depth_col   = cv2.applyColorMap(depth_vis, cv2.COLORMAP_MAGMA)
+            dh, dw      = H // 4, W // 4
+            depth_small = cv2.resize(depth_col, (dw, dh))
+            affichage[H - dh:H, W - dw:W] = depth_small
 
-        cv2.imshow("Vision Primitive — OAK-D Lite", affichage)
+        titre = "Vision Primitive — OAK-D Lite" if USE_OAKD else "Vision Primitive — Webcam"
+        cv2.imshow(titre, affichage)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             stop_event.set()
+
+
+# ─────────────────────────────────────────────────────────────
+#  THREAD 1b — ACQUISITION WEBCAM (fallback sans OAK-D)
+#  Pas de depth map → depth_map=None, z_cible désactivé.
+#  Pas d'autofocus géré (webcam fixe).
+# ─────────────────────────────────────────────────────────────
+def thread_acquisition_webcam(frame_queue: queue.Queue,
+                               stop_event: threading.Event,
+                               index: int = 0):
+    cap = cv2.VideoCapture(index)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, H)
+    cap.set(cv2.CAP_PROP_FPS,          FPS_ACQ)
+
+    if not cap.isOpened():
+        print(f"[ERREUR] Webcam index {index} inaccessible.")
+        stop_event.set()
+        return
+
+    print(f"[WEBCAM] Ouverture index {index} — {W}x{H} @ {FPS_ACQ}fps")
+
+    while not stop_event.is_set():
+        ret, frame_bgr = cap.read()
+        if not ret:
+            continue
+
+        # Resize si la webcam n'a pas respecté la résolution demandée
+        fh, fw = frame_bgr.shape[:2]
+        if fw != W or fh != H:
+            frame_bgr = cv2.resize(frame_bgr, (W, H), interpolation=cv2.INTER_AREA)
+
+        ts = datetime.now()
+
+        # Pas de depth map en mode webcam
+        if frame_queue.full():
+            try:
+                frame_queue.get_nowait()
+            except queue.Empty:
+                pass
+        frame_queue.put((frame_bgr, None, ts))
+
+    cap.release()
+
+
+# ─────────────────────────────────────────────────────────────
+#  THREAD TRAITEMENT — adapté depth optionnelle
+# ─────────────────────────────────────────────────────────────
+# (thread_traitement gère déjà depth_map=None via vision_primitive_complete)
 
 
 # ─────────────────────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    pipeline    = creer_pipeline()
     frame_queue = queue.Queue(maxsize=QUEUE_MAX)
     stop_event  = threading.Event()
 
-    with dai.Device(pipeline) as device:
+    t_trt = threading.Thread(
+        target=thread_traitement,
+        args=(frame_queue, stop_event),
+        daemon=True, name="Traitement"
+    )
+
+    if USE_OAKD:
+        pipeline = creer_pipeline()
+        with dai.Device(pipeline) as device:
+            t_acq = threading.Thread(
+                target=thread_acquisition,
+                args=(device, frame_queue, stop_event),
+                daemon=True, name="Acquisition-OAK"
+            )
+            t_acq.start()
+            t_trt.start()
+            print("Vision Primitive OAK-D Lite — Q pour quitter")
+            stop_event.wait()
+            t_acq.join(timeout=2)
+            t_trt.join(timeout=2)
+    else:
         t_acq = threading.Thread(
-            target=thread_acquisition,
-            args=(device, frame_queue, stop_event),
-            daemon=True, name="Acquisition"
-        )
-        t_trt = threading.Thread(
-            target=thread_traitement,
+            target=thread_acquisition_webcam,
             args=(frame_queue, stop_event),
-            daemon=True, name="Traitement"
+            daemon=True, name="Acquisition-Webcam"
         )
         t_acq.start()
         t_trt.start()
-
-        print("Vision Primitive OAK-D Lite — Q pour quitter")
+        print("Vision Primitive Webcam — Q pour quitter")
         stop_event.wait()
         t_acq.join(timeout=2)
         t_trt.join(timeout=2)
