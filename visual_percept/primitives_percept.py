@@ -5,8 +5,6 @@ ESPACE : analyser la frame courante et afficher l'overlay
 ESPACE (à nouveau) : retour au flux temps réel
 """
 
-import os
-import platform
 import threading
 import queue
 from datetime import datetime
@@ -39,11 +37,6 @@ except AttributeError:
 
 USE_WLS = WLS_DISPONIBLE and not IS_PI
 
-if IS_PI:
-    print("[PLATEFORME] Raspberry Pi détecté — WLS désactivé, mode allégé actif")
-else:
-    print(f"[PLATEFORME] PC/autre — WLS={'ON' if USE_WLS else 'OFF (ximgproc absent)'}")
-
 def _detecter_oakd() -> bool:
     if not DEPTHAI_DISPONIBLE:
         return False
@@ -53,13 +46,13 @@ def _detecter_oakd() -> bool:
         return False
 
 USE_OAKD = _detecter_oakd()
-print(f"[CAPTEUR] {'OAK-D Lite détecté' if USE_OAKD else 'Pas d OAK-D — fallback webcam'}")
+print(f"[CAPTEUR] {'OAK-D Lite' if USE_OAKD else 'Webcam'}")
 
 
 # ─────────────────────────────────────────────────────────────
 #  PARAMÈTRES
 # ─────────────────────────────────────────────────────────────
-W, H          = 640, 400
+W, H          = 640, 400 if USE_OAKD else 640, 480
 FPS_ACQ       = 20
 QUEUE_MAX     = 2
 PRECISION     = 0.6
@@ -73,24 +66,24 @@ LENSPOS_MAX   = 255
 #  COULEURS PAR TYPE D'OBJET
 # ─────────────────────────────────────────────────────────────
 COULEURS_PAR_LABEL = {
-    "triangle":   (0, 165, 255),    # orange
-    "carré":      (255, 0, 0),      # bleu
-    "rectangle":  (255, 255, 0),    # cyan
-    "trapèze":    (255, 165, 0),    # orange-rouge
-    "pentagone":  (128, 0, 128),    # violet
-    "hexagone":   (128, 64, 0),     # marron
-    "heptagone":  (200, 100, 0),    # marron clair
-    "octogone":   (200, 150, 0),    # ocre
-    "patatoïde":  (255, 0, 255),    # magenta
-    "cercle":     (0, 255, 0),      # vert
-    "ovale":      (0, 200, 200),    # turquoise
-    "polygone":   (0, 255, 255),    # jaune
-    "default":    (200, 200, 200)   # gris
+    "triangle":   (0, 165, 255),
+    "carré":      (255, 0, 0),
+    "rectangle":  (255, 255, 0),
+    "trapèze":    (255, 165, 0),
+    "pentagone":  (128, 0, 128),
+    "hexagone":   (128, 64, 0),
+    "heptagone":  (200, 100, 0),
+    "octogone":   (200, 150, 0),
+    "patatoïde":  (255, 0, 255),
+    "cercle":     (0, 255, 0),
+    "ovale":      (0, 200, 200),
+    "polygone":   (0, 255, 255),
+    "default":    (200, 200, 200)
 }
 
 
 # ─────────────────────────────────────────────────────────────
-#  AUTOFOCUS → LENS POSITION
+#  AUTOFOCUS (OAK-D)
 # ─────────────────────────────────────────────────────────────
 def distance_vers_lenspos(dist_mm: float) -> int:
     if dist_mm <= 0:
@@ -98,19 +91,18 @@ def distance_vers_lenspos(dist_mm: float) -> int:
     lp = int(1500 / dist_mm * 30)
     return int(np.clip(lp, LENSPOS_MIN, LENSPOS_MAX))
 
-
 def distance_mediane_centrale(depth_map: np.ndarray) -> float:
-    h, w   = depth_map.shape
-    dy     = int(h * AF_ZONE_FRAC / 2)
-    dx     = int(w * AF_ZONE_FRAC / 2)
+    h, w = depth_map.shape
+    dy = int(h * AF_ZONE_FRAC / 2)
+    dx = int(w * AF_ZONE_FRAC / 2)
     cy, cx = h // 2, w // 2
-    zone   = depth_map[cy - dy:cy + dy, cx - dx:cx + dx]
+    zone = depth_map[cy - dy:cy + dy, cx - dx:cx + dx]
     valides = zone[(zone > 100) & (zone < 15000)]
     return float(np.median(valides)) if valides.size > 0 else 0.0
 
 
 # ─────────────────────────────────────────────────────────────
-#  PIPELINE DEPTHAI
+#  PIPELINE OAK-D
 # ─────────────────────────────────────────────────────────────
 def creer_pipeline() -> dai.Pipeline:
     pipeline = dai.Pipeline()
@@ -139,15 +131,15 @@ def creer_pipeline() -> dai.Pipeline:
     stereo.setSubpixel(True)
 
     config = stereo.initialConfig.get()
-    config.postProcessing.speckleFilter.enable            = True
-    config.postProcessing.speckleFilter.speckleRange      = 60
-    config.postProcessing.temporalFilter.enable           = True
-    config.postProcessing.temporalFilter.alpha            = 0.4
-    config.postProcessing.spatialFilter.enable            = True
+    config.postProcessing.speckleFilter.enable = True
+    config.postProcessing.speckleFilter.speckleRange = 60
+    config.postProcessing.temporalFilter.enable = True
+    config.postProcessing.temporalFilter.alpha = 0.4
+    config.postProcessing.spatialFilter.enable = True
     config.postProcessing.spatialFilter.holeFillingRadius = 2
-    config.postProcessing.spatialFilter.numIterations     = 1
-    config.postProcessing.thresholdFilter.minRange        = 200
-    config.postProcessing.thresholdFilter.maxRange        = 8000
+    config.postProcessing.spatialFilter.numIterations = 1
+    config.postProcessing.thresholdFilter.minRange = 200
+    config.postProcessing.thresholdFilter.maxRange = 8000
     stereo.initialConfig.set(config)
 
     mono_l.out.link(stereo.left)
@@ -157,9 +149,9 @@ def creer_pipeline() -> dai.Pipeline:
     ctrl_in.setStreamName("control")
     ctrl_in.out.link(cam_rgb.inputControl)
 
-    xout_rgb   = pipeline.create(dai.node.XLinkOut)
+    xout_rgb = pipeline.create(dai.node.XLinkOut)
     xout_depth = pipeline.create(dai.node.XLinkOut)
-    xout_disp  = pipeline.create(dai.node.XLinkOut)
+    xout_disp = pipeline.create(dai.node.XLinkOut)
     xout_rgb.setStreamName("rgb")
     xout_depth.setStreamName("depth")
     xout_disp.setStreamName("disparity")
@@ -174,95 +166,81 @@ def creer_pipeline() -> dai.Pipeline:
 #  FILTRAGE DEPTH
 # ─────────────────────────────────────────────────────────────
 DISP_LEVELS = 96
-
 _wls_filter = None
 if USE_WLS:
     _wls_filter = cv2.ximgproc.createDisparityWLSFilterGeneric(False)
     _wls_filter.setLambda(8000)
     _wls_filter.setSigmaColor(1.5)
 
-
-def affiner_depth(depth_raw: np.ndarray,
-                  disp_raw:  np.ndarray,
-                  frame_gray: np.ndarray) -> np.ndarray:
+def affiner_depth(depth_raw, disp_raw, frame_gray):
     if USE_WLS and _wls_filter is not None:
-        disp_f        = disp_raw.astype(np.float32)
+        disp_f = disp_raw.astype(np.float32)
         filtered_disp = _wls_filter.filter(disp_f, frame_gray, disparity_map_right=None)
         filtered_disp = np.clip(filtered_disp, 0, DISP_LEVELS).astype(np.float32)
-        mask_both     = (filtered_disp > 0) & (disp_raw > 0)
-        depth_out     = depth_raw.astype(np.float32).copy()
-        ratio         = np.where(mask_both,
-                                 disp_raw.astype(np.float32) / np.maximum(filtered_disp, 1),
-                                 1.0)
+        mask_both = (filtered_disp > 0) & (disp_raw > 0)
+        depth_out = depth_raw.astype(np.float32).copy()
+        ratio = np.where(mask_both, disp_raw.astype(np.float32) / np.maximum(filtered_disp, 1), 1.0)
         depth_out = np.where(mask_both, depth_out * ratio, depth_out)
         return np.clip(depth_out, 0, 65535).astype(np.uint16)
     else:
-        d_max  = depth_raw.max() if depth_raw.max() > 0 else 1
+        d_max = depth_raw.max() if depth_raw.max() > 0 else 1
         d_norm = (depth_raw.astype(np.float32) / d_max * 255).astype(np.uint8)
         filtered = cv2.bilateralFilter(d_norm, d=5, sigmaColor=50, sigmaSpace=50)
         return (filtered.astype(np.float32) / 255 * d_max).astype(np.uint16)
 
 
 # ─────────────────────────────────────────────────────────────
-#  THREAD 1 — ACQUISITION (OAK-D)
+#  THREAD ACQUISITION OAK-D
 # ─────────────────────────────────────────────────────────────
-def thread_acquisition(device: dai.Device,
-                       frame_queue: queue.Queue,
-                       stop_event: threading.Event):
-    q_rgb   = device.getOutputQueue("rgb",   maxSize=1, blocking=False)
+def thread_acquisition_oak(device, frame_queue, stop_event):
+    q_rgb = device.getOutputQueue("rgb", maxSize=1, blocking=False)
     q_depth = device.getOutputQueue("depth", maxSize=1, blocking=False)
-    q_disp  = device.getOutputQueue("disparity", maxSize=1, blocking=False) if USE_WLS else None
-    q_ctrl  = device.getInputQueue("control")
+    q_disp = device.getOutputQueue("disparity", maxSize=1, blocking=False) if USE_WLS else None
+    q_ctrl = device.getInputQueue("control")
 
-    dernier_af     = datetime.now()
+    dernier_af = datetime.now()
     lenspos_actuel = 120
-    lenspos_cible  = 120
-
+    lenspos_cible = 120
     EMA_ALPHA = 0.25 if IS_PI else 0.35
     depth_ema = None
 
     while not stop_event.is_set():
-        in_rgb   = q_rgb.tryGet()
+        in_rgb = q_rgb.tryGet()
         in_depth = q_depth.tryGet()
-        in_disp  = q_disp.tryGet() if q_disp is not None else True
+        in_disp = q_disp.tryGet() if q_disp is not None else True
 
         if in_rgb is None or in_depth is None or in_disp is None:
             continue
 
-        frame_bgr   = in_rgb.getCvFrame()
-        depth_raw   = in_depth.getFrame()
-        disp_raw    = in_disp.getFrame().astype(np.uint8) if USE_WLS else None
-        ts          = datetime.now()
+        frame_bgr = in_rgb.getCvFrame()
+        depth_raw = in_depth.getFrame()
+        disp_raw = in_disp.getFrame().astype(np.uint8) if USE_WLS else None
+        ts = datetime.now()
 
         lenspos_reel = in_rgb.getLensPosition()
         if lenspos_reel != -1 and abs(lenspos_reel - lenspos_cible) > 2:
             continue
 
         frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        depth_filtre = affiner_depth(
-            depth_raw,
-            disp_raw if disp_raw is not None else np.zeros_like(depth_raw, dtype=np.uint8),
-            frame_gray
-        )
+        depth_filtre = affiner_depth(depth_raw, disp_raw if disp_raw is not None else np.zeros_like(depth_raw, dtype=np.uint8), frame_gray)
 
         if depth_ema is None:
             depth_ema = depth_filtre.astype(np.float32)
         else:
             mask = depth_filtre > 0
-            depth_ema[mask] = (EMA_ALPHA * depth_filtre[mask].astype(np.float32)
-                               + (1 - EMA_ALPHA) * depth_ema[mask])
+            depth_ema[mask] = (EMA_ALPHA * depth_filtre[mask].astype(np.float32) + (1 - EMA_ALPHA) * depth_ema[mask])
         depth_final = np.clip(depth_ema, 0, 65535).astype(np.uint16)
 
         if (ts - dernier_af).total_seconds() >= AF_PERIODE_S:
-            dist_mm    = distance_mediane_centrale(depth_final)
+            dist_mm = distance_mediane_centrale(depth_final)
             nouveau_lp = distance_vers_lenspos(dist_mm)
             if abs(nouveau_lp - lenspos_actuel) > 5:
                 ctrl = dai.CameraControl()
                 ctrl.setManualFocus(nouveau_lp)
                 q_ctrl.send(ctrl)
                 lenspos_actuel = nouveau_lp
-                lenspos_cible  = nouveau_lp
-                depth_ema      = None
+                lenspos_cible = nouveau_lp
+                depth_ema = None
             dernier_af = ts
 
         if frame_queue.full():
@@ -274,40 +252,33 @@ def thread_acquisition(device: dai.Device,
 
 
 # ─────────────────────────────────────────────────────────────
-#  THREAD 1b — ACQUISITION WEBCAM
+#  THREAD ACQUISITION WEBCAM
 # ─────────────────────────────────────────────────────────────
-def thread_acquisition_webcam(frame_queue: queue.Queue,
-                               stop_event: threading.Event,
-                               index: int = 0):
-    cap = cv2.VideoCapture(index)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  W)
+def thread_acquisition_webcam(frame_queue, stop_event):
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, H)
-    cap.set(cv2.CAP_PROP_FPS,          FPS_ACQ)
+    cap.set(cv2.CAP_PROP_FPS, FPS_ACQ)
 
     if not cap.isOpened():
-        print(f"[ERREUR] Webcam index {index} inaccessible.")
+        print("[ERREUR] Webcam inaccessible")
         stop_event.set()
         return
 
-    print(f"[WEBCAM] Ouverture index {index} — {W}x{H} @ {FPS_ACQ}fps")
+    print(f"[WEBCAM] {W}x{H} @ {FPS_ACQ}fps")
 
     while not stop_event.is_set():
-        ret, frame_bgr = cap.read()
+        ret, frame = cap.read()
         if not ret:
             continue
-
-        fh, fw = frame_bgr.shape[:2]
-        if fw != W or fh != H:
-            frame_bgr = cv2.resize(frame_bgr, (W, H), interpolation=cv2.INTER_AREA)
-
-        ts = datetime.now()
-
+        if frame.shape[:2] != (H, W):
+            frame = cv2.resize(frame, (W, H))
         if frame_queue.full():
             try:
                 frame_queue.get_nowait()
-            except queue.Empty:
+            except:
                 pass
-        frame_queue.put((frame_bgr, None, ts))
+        frame_queue.put((frame, None, datetime.now()))
 
     cap.release()
 
@@ -322,7 +293,7 @@ def est_trapeze(sommets):
     for i in range(4):
         x1, y1 = sommets[i]
         x2, y2 = sommets[(i + 1) % 4]
-        v    = (x2 - x1, y2 - y1)
+        v = (x2 - x1, y2 - y1)
         norm = np.sqrt(v[0]**2 + v[1]**2)
         vecteurs.append((v[0]/norm, v[1]/norm) if norm > 0 else (0, 0))
     p1 = abs(vecteurs[0][0]*vecteurs[2][0] + vecteurs[0][1]*vecteurs[2][1]) > 0.92
@@ -339,14 +310,14 @@ def tester_patatoide(cnt):
         return False, None
     excentricite = eb / ea
     aire_ellipse = np.pi * (ea / 2) * (eb / 2)
-    ratio        = cv2.contourArea(cnt) / aire_ellipse if aire_ellipse > 0 else 0
+    ratio = cv2.contourArea(cnt) / aire_ellipse if aire_ellipse > 0 else 0
     if not (ratio > 0.60 and excentricite > 0.30):
         return False, None
     cos_a, sin_a = np.cos(np.radians(angle)), np.sin(np.radians(angle))
     rx, ry = ea / 2, eb / 2
-    pts    = cnt[:, 0, :].astype(np.float32)
-    dx     =  (pts[:, 0] - ex) * cos_a + (pts[:, 1] - ey) * sin_a
-    dy     = -(pts[:, 0] - ex) * sin_a + (pts[:, 1] - ey) * cos_a
+    pts = cnt[:, 0, :].astype(np.float32)
+    dx = (pts[:, 0] - ex) * cos_a + (pts[:, 1] - ey) * sin_a
+    dy = -(pts[:, 0] - ex) * sin_a + (pts[:, 1] - ey) * cos_a
     dist_norm = np.sqrt((dx / rx)**2 + (dy / ry)**2)
     return (True, ellipse) if float(np.std(dist_norm)) > 0.15 else (False, None)
 
@@ -366,7 +337,7 @@ def simplifier_convexe(hull, n_max=8):
     perim = cv2.arcLength(hull, True)
     lo, hi, best = 0.005, 0.40, cv2.approxPolyDP(hull, 0.005 * perim, True)
     for _ in range(22):
-        mid    = (lo + hi) / 2
+        mid = (lo + hi) / 2
         approx = cv2.approxPolyDP(hull, mid * perim, True)
         if len(approx) <= n_max:
             best, hi = approx, mid
@@ -379,49 +350,47 @@ def classifier_forme(sommets, label_pata=False):
     if label_pata:
         return "patatoïde"
     n = len(sommets)
-    if n == 3: return "triangle"
+    if n == 3:
+        return "triangle"
     if n == 4:
         x, y, w, h = cv2.boundingRect(np.array(sommets))
         ratio = max(w, h) / (min(w, h) + 0.01)
-        if est_trapeze(sommets): return "trapèze"
+        if est_trapeze(sommets):
+            return "trapèze"
         return "carré" if ratio < 1.15 else "rectangle"
     return {5: "pentagone", 6: "hexagone", 7: "heptagone", 8: "octogone"}.get(n, "polygone")
 
 
-def analyser_photometrie(image_gris, masque=None):
+def analyser_photometrie(img, masque=None):
     if masque is not None:
-        v = image_gris[masque > 0]
+        v = img[masque > 0]
         return (float(np.mean(v)), float(np.std(v))) if v.size > 0 else (0., 0.)
-    return float(np.mean(image_gris)), float(np.std(image_gris))
+    return float(np.mean(img)), float(np.std(img))
 
 
 SEUIL_AIRE_RELATIVE = 0.05
 PROFONDEUR_MAX = 2
 
 
-def _extraire_formes(gray: np.ndarray,
-                     aire_parente: float,
-                     precision: float,
-                     profondeur: int,
-                     lum_globale: float) -> list:
+def _extraire_formes(gray, aire_parente, precision, profondeur, lum_globale):
     h, w = gray.shape
     seuil_aire = max(aire_parente * SEUIL_AIRE_RELATIVE, 200)
 
-    div        = max(2, min(10, int(12 - precision * 8)))
-    canny_low  = int(80  - precision * 60)
+    div = max(2, min(10, int(12 - precision * 8)))
+    canny_low = int(80 - precision * 60)
     canny_high = int(150 - precision * 90)
 
-    small   = cv2.resize(gray, (max(1, w//div), max(1, h//div)), interpolation=cv2.INTER_AREA)
+    small = cv2.resize(gray, (max(1, w//div), max(1, h//div)), interpolation=cv2.INTER_AREA)
     morphed = cv2.morphologyEx(small, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     morphed = cv2.morphologyEx(morphed, cv2.MORPH_CLOSE,
                                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
-    recon   = cv2.resize(morphed, (w, h), interpolation=cv2.INTER_LINEAR)
-    edges   = cv2.Canny(recon, canny_low, canny_high)
+    recon = cv2.resize(morphed, (w, h), interpolation=cv2.INTER_LINEAR)
+    edges = cv2.Canny(recon, canny_low, canny_high)
 
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contours     = sorted(contours, key=cv2.contourArea, reverse=True)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
 
-    objets         = []
+    objets = []
     masque_utilise = np.zeros((h, w), dtype=np.uint8)
 
     for cnt in contours:
@@ -437,12 +406,12 @@ def _extraire_formes(gray: np.ndarray,
         pata, ellipse = tester_patatoide(cnt)
         if pata:
             sommets = ellipse_en_points(ellipse, n=24)
-            label   = "patatoïde"
+            label = "patatoïde"
         else:
-            hull    = cv2.convexHull(cnt)
-            approx  = simplifier_convexe(hull, n_max=8)
+            hull = cv2.convexHull(cnt)
+            approx = simplifier_convexe(hull, n_max=8)
             sommets = [tuple(pt[0]) for pt in approx]
-            label   = classifier_forme(sommets)
+            label = classifier_forme(sommets)
 
         if len(sommets) < 3:
             continue
@@ -453,60 +422,42 @@ def _extraire_formes(gray: np.ndarray,
 
         x, y, wb, hb = cv2.boundingRect(np.array(sommets))
         objets.append({
-            "label"      : label,
-            "profondeur" : profondeur,
-            "n_sommets"  : len(sommets),
-            "points"     : sommets,
-            "centre"     : (int(x + wb/2), int(y + hb/2)),
-            "bbox"       : (int(x), int(y), int(wb), int(hb)),
-            "aire"       : int(cv2.contourArea(cnt)),
-            "couleur"    : COULEURS_PAR_LABEL.get(label, COULEURS_PAR_LABEL["default"]),
-            "photometrie": {
-                "lum_locale"       : round(lum_loc, 2),
-                "std_locale"       : round(std_loc, 2),
-                "contraste_relatif": round(lum_loc / (lum_globale + 0.1), 2)
-            },
-            "enfants"    : []
+            "label": label,
+            "profondeur": profondeur,
+            "points": sommets,
+            "bbox": (int(x), int(y), int(wb), int(hb)),
+            "aire": int(cv2.contourArea(cnt)),
+            "couleur": COULEURS_PAR_LABEL.get(label, COULEURS_PAR_LABEL["default"]),
+            "enfants": []
         })
 
     return objets
 
 
 def vision_primitive_complete(frame, depth_map=None, z_cible=None, precision=0.5, profondeur=0):
-    h, w  = frame.shape[:2]
-    gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame.copy()
-    lum_globale, std_globale = analyser_photometrie(gray)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    lum_globale, _ = analyser_photometrie(gray)
 
     if profondeur == 0 and depth_map is not None and z_cible is not None:
         z_min, z_max = max(0, z_cible - 250), z_cible + 250
         gray = np.where((depth_map >= z_min) & (depth_map <= z_max), gray, 0).astype(np.uint8)
 
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    gray  = clahe.apply(gray)
+    gray = clahe.apply(gray)
 
+    h, w = frame.shape[:2]
     aire_scene = float(w * h)
-
-    # Reconstruction pour affichage (uniquement niveau 0)
-    div     = max(2, min(10, int(12 - precision * 8)))
-    small   = cv2.resize(gray, (max(1, w//div), max(1, h//div)), interpolation=cv2.INTER_AREA)
-    morphed = cv2.morphologyEx(small, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    morphed = cv2.morphologyEx(morphed, cv2.MORPH_CLOSE,
-                               cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
-    recon   = cv2.resize(morphed, (w, h), interpolation=cv2.INTER_LINEAR)
-    canny_low  = int(80  - precision * 60)
-    canny_high = int(150 - precision * 90)
-    edges   = cv2.Canny(recon, canny_low, canny_high)
 
     objets = _extraire_formes(gray, aire_scene, precision, profondeur, lum_globale)
 
     if profondeur < PROFONDEUR_MAX:
         for obj in objets:
             bx, by, bw, bh = obj["bbox"]
-            marge  = int(min(bw, bh) * 0.10)
-            x1     = max(0, bx - marge)
-            y1     = max(0, by - marge)
-            x2     = min(w,  bx + bw + marge)
-            y2     = min(h,  by + bh + marge)
+            marge = int(min(bw, bh) * 0.10)
+            x1 = max(0, bx - marge)
+            y1 = max(0, by - marge)
+            x2 = min(w, bx + bw + marge)
+            y2 = min(h, by + bh + marge)
 
             roi_gray = gray[y1:y2, x1:x2]
             if roi_gray.size == 0:
@@ -520,87 +471,44 @@ def vision_primitive_complete(frame, depth_map=None, z_cible=None, precision=0.5
 
             for enfant in enfants:
                 enfant["points"] = [(px + x1, py + y1) for px, py in enfant["points"]]
-                enfant["centre"] = (enfant["centre"][0] + x1, enfant["centre"][1] + y1)
                 ex, ey, ew, eh = enfant["bbox"]
                 enfant["bbox"] = (ex + x1, ey + y1, ew, eh)
 
             obj["enfants"] = enfants
 
-    return recon, edges, objets, {
-        "lum_globale": round(lum_globale, 2),
-        "std_globale": round(std_globale, 2)
-    }
+    return objets, {"lum_globale": round(lum_globale, 2)}
 
 
 # ─────────────────────────────────────────────────────────────
-#  THREAD TRAITEMENT (analyse sur demande)
+#  THREAD TRAITEMENT
 # ─────────────────────────────────────────────────────────────
-def thread_traitement(frame_queue: queue.Queue,
-                      analyse_queue: queue.Queue,
-                      stop_event: threading.Event):
-    """
-    Stocke la dernière frame reçue.
-    Quand une analyse est demandée, exécute la vision sur cette frame.
-    """
+def thread_traitement(frame_queue, analyse_queue, stop_event):
     derniere_frame = None
     derniere_depth = None
-    dernier_ts = None
 
     while not stop_event.is_set():
-        # Récupérer la dernière frame disponible
         try:
-            frame_bgr, depth_map, ts = frame_queue.get(timeout=0.05)
-            derniere_frame = frame_bgr
-            derniere_depth = depth_map
-            dernier_ts = ts
+            frame, depth, _ = frame_queue.get(timeout=0.05)
+            derniere_frame = frame
+            derniere_depth = depth
         except queue.Empty:
             pass
 
-        # Vérifier si une analyse est demandée
         try:
             analyse_queue.get_nowait()
             if derniere_frame is not None:
                 z_cible = distance_mediane_centrale(derniere_depth) if derniere_depth is not None else 0.0
-                _, _, objets, scene = vision_primitive_complete(
+                objets, scene = vision_primitive_complete(
                     derniere_frame,
                     depth_map=derniere_depth,
                     z_cible=z_cible if z_cible > 0 else None,
                     precision=PRECISION
                 )
-                # Retourner le résultat
-                analyse_queue.put((derniere_frame.copy(), objets, scene, dernier_ts))
+                analyse_queue.put((derniere_frame.copy(), objets, scene))
+            else:
+                analyse_queue.put((None, [], {}))
         except queue.Empty:
             pass
-
-
-# ─────────────────────────────────────────────────────────────
-#  FONCTION DE DESSIN DE L'OVERLAY
-# ─────────────────────────────────────────────────────────────
-def dessiner_overlay(canvas, objets):
-    """Dessine les objets avec leurs bounding boxes et contours colorés"""
-    def dessiner_objet(c, obj):
-        pts = np.array(obj["points"], dtype=np.int32)
-        couleur = obj["couleur"]
-        epaisseur = 2 if obj["profondeur"] == 0 else 1
-        
-        # Contour
-        cv2.drawContours(c, [pts], -1, couleur, epaisseur)
-        
-        # Bounding box
-        x, y, w, h = obj["bbox"]
-        cv2.rectangle(c, (x, y), (x+w, y+h), couleur, 1)
-        
-        # Label
-        fonte = max(0.3, 0.45 - obj["profondeur"] * 0.1)
-        cv2.putText(c, obj["label"], (x, y-5),
-                    cv2.FONT_HERSHEY_SIMPLEX, fonte, couleur, 1)
-        
-        # Enfants
-        for enfant in obj.get("enfants", []):
-            dessiner_objet(c, enfant)
-    
-    for obj in objets:
-        dessiner_objet(canvas, obj)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -611,67 +519,50 @@ if __name__ == "__main__":
     analyse_queue = queue.Queue(maxsize=1)
     stop_event = threading.Event()
 
-    # Démarrer le thread d'acquisition
     if USE_OAKD:
         pipeline = creer_pipeline()
         device = dai.Device(pipeline)
-        t_acq = threading.Thread(
-            target=thread_acquisition,
-            args=(device, frame_queue, stop_event),
-            daemon=True, name="Acquisition-OAK"
-        )
+        t_acq = threading.Thread(target=thread_acquisition_oak, args=(device, frame_queue, stop_event), daemon=True)
     else:
-        t_acq = threading.Thread(
-            target=thread_acquisition_webcam,
-            args=(frame_queue, stop_event),
-            daemon=True, name="Acquisition-Webcam"
-        )
-    t_acq.start()
+        t_acq = threading.Thread(target=thread_acquisition_webcam, args=(frame_queue, stop_event), daemon=True)
 
-    # Démarrer le thread de traitement (analyse sur demande)
-    t_trt = threading.Thread(
-        target=thread_traitement,
-        args=(frame_queue, analyse_queue, stop_event),
-        daemon=True, name="Traitement"
-    )
+    t_trt = threading.Thread(target=thread_traitement, args=(frame_queue, analyse_queue, stop_event), daemon=True)
+
+    t_acq.start()
     t_trt.start()
 
-    # Variables d'affichage
     mode_analyse = False
-    frame_affichee = None
-    objets_affiches = None
+    frame_fige = None
+    objets_figes = None
     scene_stats = None
-    ts_analyse = None
 
-    titre = "Vision Primitive — OAK-D Lite" if USE_OAKD else "Vision Primitive — Webcam"
-
-    print("=== Vision Primitive ===")
-    print("ESPACE : analyser la frame courante et afficher l'overlay")
-    print("ESPACE (à nouveau) : retour au flux temps réel")
-    print("q : quitter")
+    print("\n=== Vision Primitive ===")
+    print("ESPACE : analyser la frame courante")
+    print("q : quitter\n")
 
     while not stop_event.is_set():
-        if mode_analyse and frame_affichee is not None:
-            # Mode overlay : afficher la frame analysée avec les dessins
-            affichage = frame_affichee.copy()
-            dessiner_overlay(affichage, objets_affiches)
-            
-            # Informations
-            z_str = "z:N/A"
-            if USE_OAKD and ts_analyse:
-                # Récupérer la profondeur de la frame analysée
-                pass
-            hud = f"ANALYSE FIGEE | {scene_stats['lum_globale']:.0f} lum | ESPACE pour reprendre"
-            cv2.putText(affichage, hud, (8, 18),
+        if mode_analyse and frame_fige is not None:
+            # Affichage figé avec overlay
+            aff = frame_fige.copy()
+            for obj in objets_figes:
+                pts = np.array(obj["points"], dtype=np.int32)
+                couleur = obj["couleur"]
+                cv2.drawContours(aff, [pts], -1, couleur, 2)
+                x, y, w, h = obj["bbox"]
+                cv2.rectangle(aff, (x, y), (x+w, y+h), couleur, 1)
+                cv2.putText(aff, obj["label"], (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, couleur, 1)
+                for enfant in obj.get("enfants", []):
+                    pts_e = np.array(enfant["points"], dtype=np.int32)
+                    cv2.drawContours(aff, [pts_e], -1, enfant["couleur"], 1)
+                    ex, ey, ew, eh = enfant["bbox"]
+                    cv2.rectangle(aff, (ex, ey), (ex+ew, ey+eh), enfant["couleur"], 1)
+            cv2.putText(aff, "ANALYSE FIGEE - ESPACE pour reprendre", (8, 18),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-            cv2.putText(affichage, f"Objets: {len(objets_affiches)}", (8, 45),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
-            cv2.imshow(titre, affichage)
+            cv2.imshow("Vision Primitive", aff)
         else:
-            # Mode temps réel : afficher le flux brut
             try:
-                frame_bgr, _, _ = frame_queue.get(timeout=0.05)
-                cv2.imshow(titre, frame_bgr)
+                frame, _, _ = frame_queue.get(timeout=0.05)
+                cv2.imshow("Vision Primitive", frame)
             except queue.Empty:
                 pass
 
@@ -680,27 +571,27 @@ if __name__ == "__main__":
             stop_event.set()
         elif key == ord(' '):
             if not mode_analyse:
-                # Demander une analyse
+                print("📸 Capture...")
                 try:
-                    analyse_queue.put_nowait("analyse")
-                except queue.Full:
+                    analyse_queue.get_nowait()
+                except:
                     pass
-                # Attendre le résultat (timeout 0.5s)
+                analyse_queue.put("analyse")
                 try:
-                    frame_affichee, objets_affiches, scene_stats, ts_analyse = analyse_queue.get(timeout=0.5)
-                    mode_analyse = True
-                    print(f"✅ Analyse effectuée : {len(objets_affiches)} objet(s) détecté(s)")
+                    frame_fige, objets_figes, scene_stats = analyse_queue.get(timeout=2.0)
+                    if frame_fige is not None:
+                        mode_analyse = True
+                        print(f"✅ {len(objets_figes)} objet(s) détecté(s)")
+                    else:
+                        print("❌ Pas de frame")
                 except queue.Empty:
-                    print("❌ Erreur : analyse non disponible")
+                    print("❌ Timeout")
             else:
-                # Quitter le mode overlay
                 mode_analyse = False
-                frame_affichee = None
-                objets_affiches = None
-                print("🔄 Retour au flux temps réel")
+                frame_fige = None
+                print("🔄 Retour temps réel")
 
-    # Nettoyage
     if USE_OAKD:
         device.close()
     cv2.destroyAllWindows()
-    print("Arrêt propre.")
+    print("Arrêt.")
