@@ -895,6 +895,139 @@ def segmenter_roi(roi_bgr: np.ndarray,
     }
 
 
+
+# ─────────────────────────────────────────────────────────────
+#  SCORE SLAM — Utilisabilité d'une ROI pour la localisation
+# ─────────────────────────────────────────────────────────────
+# Seuils de qualification
+SLAM_SEUIL_OK       = 0.55   # vert  — ROI fiable pour SLAM
+SLAM_SEUIL_MAYBE    = 0.30   # orange — ROI borderline
+SLAM_MIN_KEYPOINTS  = 8      # nombre minimum de keypoints détectables
+
+
+def scorer_slam(roi_bgr: np.ndarray,
+                masque_z: np.ndarray,
+                sigma_z: float | None,
+                coherence_z: float) -> dict:
+    """
+    Évalue l'utilisabilité d'une ROI pour le SLAM.
+
+    Critères combinés :
+      - texture       : richesse des gradients locaux (Laplacian variance)
+      - coherence_z   : stabilité de la profondeur (passée depuis assainir_roi)
+      - lisibilite    : plage photométrique exploitable (ni trop sombre ni saturée)
+      - taille        : surface suffisante pour extraire des keypoints
+      - n_keypoints   : nombre de coins Harris détectables
+
+    Retourne :
+    {
+        "score"       : float [0,1]
+        "tag"         : "OK" | "MAYBE" | "NON"
+        "couleur_tag" : BGR tuple
+        "detail"      : dict des composantes
+        "n_keypoints" : int
+    }
+    """
+    h, w = roi_bgr.shape[:2]
+
+    # Zone valide uniquement
+    valide = masque_z > 0
+    if not valide.any():
+        return {"score": 0.0, "tag": "NON",
+                "couleur_tag": (0, 0, 180),
+                "detail": {}, "n_keypoints": 0}
+
+    gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+
+    # ── 1. Texture — variance du Laplacien sur la zone valide ────────────────
+    lap     = cv2.Laplacian(gray.astype(np.float32), cv2.CV_32F)
+    lap_vals = lap[valide]
+    texture  = float(np.var(lap_vals)) if lap_vals.size > 0 else 0.0
+    # Normalisation empirique : variance > 500 → très texturé
+    texture_n = float(min(1.0, texture / 500.0))
+
+    # ── 2. Lisibilité photométrique ──────────────────────────────────────────
+    gray_vals = gray[valide].astype(np.float32)
+    lum_moy   = float(np.mean(gray_vals)) if gray_vals.size > 0 else 0.0
+    lum_std   = float(np.std(gray_vals))  if gray_vals.size > 0 else 0.0
+    # Optimal : luminance entre 40-220, std > 20 (pas d'aplat)
+    lum_ok    = 1.0 - abs(lum_moy - 130) / 130.0   # pic à 130
+    lum_ok    = max(0.0, lum_ok)
+    std_ok    = min(1.0, lum_std / 60.0)
+    lisibilite = 0.5 * lum_ok + 0.5 * std_ok
+
+    # ── 3. Taille — fraction de pixels valides ───────────────────────────────
+    frac_valide = float(valide.sum()) / (h * w)
+    taille_n    = min(1.0, frac_valide / 0.5)   # 50% valide → score max
+
+    # ── 4. Keypoints Harris ──────────────────────────────────────────────────
+    corners   = cv2.cornerHarris(gray, blockSize=3, ksize=3, k=0.04)
+    corners   = np.clip(corners, 0, None)
+    seuil_kp  = corners.max() * 0.01 if corners.max() > 0 else 1.0
+    masque_kp = (corners > seuil_kp) & valide
+    n_kp      = int(masque_kp.sum())
+    kp_n      = min(1.0, n_kp / 30.0)   # 30 keypoints → score max
+
+    # ── 5. Cohérence Z (déjà calculée) ──────────────────────────────────────
+    coh_n = float(coherence_z)
+
+    # ── Score final ──────────────────────────────────────────────────────────
+    score = (texture_n  * 0.30 +
+             lisibilite * 0.20 +
+             taille_n   * 0.15 +
+             kp_n       * 0.20 +
+             coh_n      * 0.15)
+
+    # Pénalité si trop peu de keypoints (SLAM impossible sans ancres)
+    if n_kp < SLAM_MIN_KEYPOINTS:
+        score *= 0.4
+
+    score = float(min(1.0, score))
+
+    if score >= SLAM_SEUIL_OK:
+        tag, couleur = "OK",    (0, 200, 0)      # vert
+    elif score >= SLAM_SEUIL_MAYBE:
+        tag, couleur = "MAYBE", (0, 140, 255)    # orange
+    else:
+        tag, couleur = "NON",   (0, 0, 180)      # rouge sombre
+
+    return {
+        "score"      : round(score, 3),
+        "tag"        : tag,
+        "couleur_tag": couleur,
+        "n_keypoints": n_kp,
+        "detail"     : {
+            "texture"   : round(texture_n,  3),
+            "lisibilite": round(lisibilite, 3),
+            "taille"    : round(taille_n,   3),
+            "keypoints" : round(kp_n,       3),
+            "coherence_z": round(coh_n,     3),
+        }
+    }
+
+
+def dessiner_tag_slam(canvas: np.ndarray, bbox: tuple, slam: dict):
+    """
+    Dessine le badge SLAM sur la bbox d'un POI.
+    SLAM✓ en vert, SLAM? en orange, rien si NON.
+    """
+    if slam["tag"] == "NON":
+        return
+
+    x1, y1, x2, y2 = bbox
+    couleur = slam["couleur_tag"]
+    symbole = "✓" if slam["tag"] == "OK" else "?"
+    label   = f"SLAM{symbole} {slam['score']:.2f} ({slam['n_keypoints']}kp)"
+
+    # Badge fond semi-transparent en bas de la bbox
+    bx1, by1 = x1, y2 - 16
+    bx2, by2 = x1 + len(label) * 7 + 6, y2
+    overlay  = canvas.copy()
+    cv2.rectangle(overlay, (bx1, by1), (bx2, by2), couleur, -1)
+    cv2.addWeighted(overlay, 0.5, canvas, 0.5, 0, canvas)
+    cv2.putText(canvas, label, (bx1 + 3, by2 - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1)
+
 # ─────────────────────────────────────────────────────────────
 #  PIPELINE OAK-D
 # ─────────────────────────────────────────────────────────────
@@ -1111,6 +1244,9 @@ if __name__ == "__main__":
 
                     dessiner_chemin_attentionnel(affichage, pois)
                     dessiner_lignes_structures(affichage, lignes_v, lignes_h, intersections)
+                    # Tags SLAM sur les POIs scorés
+                    if pois[0].get("slam"):
+                        dessiner_tag_slam(affichage, pois[0]["bbox"], pois[0]["slam"])
 
                     print(f"{len(pois)} POI(s) :")
                     for i, p in enumerate(pois):
@@ -1147,6 +1283,15 @@ if __name__ == "__main__":
                     )
                     p0["segmentation"] = seg
 
+                    # Score SLAM
+                    slam = scorer_slam(
+                        p0["roi_assainie"],
+                        p0["masque_z"],
+                        p0.get("sigma_z"),
+                        p0.get("coherence_z", 0.5)
+                    )
+                    p0["slam"] = slam
+
                     # Mask coloré — affiché en debug
                     mask_vis = cv2.resize(seg["mask_vis"], (320, 200),
                                           interpolation=cv2.INTER_NEAREST)
@@ -1178,6 +1323,13 @@ if __name__ == "__main__":
                               f"aire:{reg['aire']}px²  "
                               f"centre:{reg['centre']}  "
                               f"z:{reg['z_median']}mm")
+                    if p0.get("slam"):
+                        sl = p0["slam"]
+                        print(f"  SLAM POI#1 : tag:{sl['tag']}  "
+                              f"score:{sl['score']}  kp:{sl['n_keypoints']}  "
+                              f"tex:{sl['detail']['texture']}  "
+                              f"lum:{sl['detail']['lisibilite']}  "
+                              f"coh_z:{sl['detail']['coherence_z']}")
 
                 # Debug saillance | mouvement
                 fs = cv2.resize(derniere_frame,
