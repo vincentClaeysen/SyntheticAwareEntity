@@ -929,23 +929,29 @@ def afficher_heatmap(frame, carte):
 #  PIPELINE OAK-D
 # ─────────────────────────────────────────────────────────────
 def creer_pipeline():
+    """
+    Pipeline depthai v3.
+    - XLinkOut/XLinkIn supprimés : queues créées directement sur les outputs
+    - Camera node unifié remplace ColorCamera + MonoCamera
+    - pipeline.start() remplace dai.Device(pipeline)
+    """
     pipeline = dai.Pipeline()
-    cam_rgb  = pipeline.create(dai.node.ColorCamera)
-    cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
-    cam_rgb.setPreviewSize(W, H)
-    cam_rgb.setInterleaved(False)
-    cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
-    cam_rgb.setFps(FPS_ACQ)
-    cam_rgb.initialControl.setManualFocus(120)
 
-    mono_l = pipeline.create(dai.node.MonoCamera)
-    mono_r = pipeline.create(dai.node.MonoCamera)
-    for mono, socket in [(mono_l, dai.CameraBoardSocket.CAM_B),
-                         (mono_r, dai.CameraBoardSocket.CAM_C)]:
-        mono.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
-        mono.setBoardSocket(socket)
-        mono.setFps(FPS_ACQ)
+    # ── Caméra RGB (nouveau node Camera unifié) ───────────────────────────────
+    cam_rgb = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
+    rgb_out = cam_rgb.requestOutput(
+        (W, H),
+        type=dai.ImgFrame.Type.BGR888p,
+        fps=FPS_ACQ
+    )
 
+    # ── Caméras stéréo mono ───────────────────────────────────────────────────
+    mono_l = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
+    mono_r = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C)
+    mono_l_out = mono_l.requestOutput((640, 400), type=dai.ImgFrame.Type.GRAY8, fps=FPS_ACQ)
+    mono_r_out = mono_r.requestOutput((640, 400), type=dai.ImgFrame.Type.GRAY8, fps=FPS_ACQ)
+
+    # ── Depth ─────────────────────────────────────────────────────────────────
     stereo = pipeline.create(dai.node.StereoDepth)
     stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
     stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)
@@ -963,17 +969,16 @@ def creer_pipeline():
     cfg.postProcessing.thresholdFilter.minRange        = 200
     cfg.postProcessing.thresholdFilter.maxRange        = 8000
     stereo.initialConfig.set(cfg)
-    mono_l.out.link(stereo.left)
-    mono_r.out.link(stereo.right)
 
-    ctrl_in = pipeline.create(dai.node.XLinkIn)
-    ctrl_in.setStreamName("control")
-    ctrl_in.out.link(cam_rgb.inputControl)
+    mono_l_out.link(stereo.left)
+    mono_r_out.link(stereo.right)
 
-    for name, src in [("rgb", cam_rgb.preview), ("depth", stereo.depth)]:
-        xout = pipeline.create(dai.node.XLinkOut)
-        xout.setStreamName(name)
-        src.link(xout.input)
+    # ── Queues de sortie (v3 : directement sur les outputs, sans XLinkOut) ────
+    pipeline._rgb_queue   = rgb_out.createOutputQueue(maxSize=1, blocking=False)
+    pipeline._depth_queue = stereo.depth.createOutputQueue(maxSize=1, blocking=False)
+
+    # ── Contrôle caméra (v3 : inputControl queue directement) ────────────────
+    pipeline._ctrl_queue  = cam_rgb.inputControl.createInputQueue()
 
     return pipeline
 
@@ -981,18 +986,22 @@ def creer_pipeline():
 # ─────────────────────────────────────────────────────────────
 #  THREADS ACQUISITION
 # ─────────────────────────────────────────────────────────────
-def thread_acquisition_oak(device, frame_queue, stop_event):
-    log_acq.info("Thread OAK-D démarré")
-    q_rgb   = device.getOutputQueue("rgb",   maxSize=1, blocking=False)
-    q_depth = device.getOutputQueue("depth", maxSize=1, blocking=False)
-    q_ctrl  = device.getInputQueue("control")
+def thread_acquisition_oak(pipeline, frame_queue, stop_event):
+    """
+    Thread d'acquisition v3 — utilise les queues attachées au pipeline.
+    Le pipeline est déjà démarré (pipeline.start()) avant l'appel.
+    """
+    log_acq.info("Thread OAK-D démarré (depthai v3)")
+    q_rgb   = pipeline._rgb_queue
+    q_depth = pipeline._depth_queue
+    q_ctrl  = pipeline._ctrl_queue
 
     dernier_af     = datetime.now()
     lenspos_actuel = lenspos_cible = 120
     EMA_ALPHA      = 0.25 if IS_PI else 0.35
     depth_ema      = None
 
-    while not stop_event.is_set():
+    while not stop_event.is_set() and pipeline.isRunning():
         try:
             in_rgb   = q_rgb.tryGet()
             in_depth = q_depth.tryGet()
@@ -1083,9 +1092,9 @@ if __name__ == "__main__":
     if USE_OAKD:
         try:
             pipeline = creer_pipeline()
-            device   = dai.Device(pipeline)
+            pipeline.start()   # v3 : démarre le pipeline (remplace dai.Device(pipeline))
             t_acq    = threading.Thread(target=thread_acquisition_oak,
-                                        args=(device, frame_queue, stop_event),
+                                        args=(pipeline, frame_queue, stop_event),
                                         daemon=True, name="Acq-OAK")
         except Exception as e:
             log.error(f"Impossible d'ouvrir l'OAK-D : {e} — fallback webcam")
@@ -1292,10 +1301,10 @@ if __name__ == "__main__":
 
     if USE_OAKD:
         try:
-            device.close()
-            log.info("OAK-D fermé")
+            pipeline.stop()   # v3 : arrêt propre du pipeline
+            log.info("Pipeline OAK-D arrêté")
         except Exception as e:
-            log.error(f"Erreur fermeture OAK-D : {e}")
+            log.error(f"Erreur fermeture pipeline OAK-D : {e}")
 
     cv2.destroyAllWindows()
     log.info("Arrêt propre.")
