@@ -925,38 +925,415 @@ def afficher_heatmap(frame, carte):
                            COULEUR_HEATMAP_ALPHA, 0)
 
 
+
+
+# ─────────────────────────────────────────────────────────────
+#  QUALIFICATION DE LA DEPTH MAP
+# ─────────────────────────────────────────────────────────────
+
+def qualifier_depth(depth_map: np.ndarray | None,
+                    bloc_size: int = 16) -> dict:
+    """
+    Analyse la qualité de la depth map en blocs.
+
+    Pour chaque bloc calcule :
+      - taux_valides  : fraction de pixels dans la plage [100, 15000]mm
+      - sigma_local   : écart-type des pixels valides (bruit)
+      - speckle_ratio : fraction de pixels isolés (résidu après filtrage)
+
+    Produit :
+      - carte_fiabilite : np.ndarray float32 [0,1], même grille que les blocs
+      - sigma_median    : σ médian global → utilisé pour adapter les seuils
+      - taux_valide_global : fraction globale de pixels valides
+      - zones_fiables   : masque booléen pleine résolution (True = fiable)
+    """
+    if depth_map is None:
+        return {
+            "carte_fiabilite"   : None,
+            "sigma_median"      : 999.0,
+            "taux_valide_global": 0.0,
+            "zones_fiables"     : None,
+            "seuil_sigma_h"     : 40.0,
+            "seuil_sigma_v"     : 60.0,
+        }
+
+    h, w     = depth_map.shape
+    depth_f  = depth_map.astype(np.float32)
+    n_bh     = max(1, h // bloc_size)
+    n_bw     = max(1, w // bloc_size)
+    carte    = np.zeros((n_bh, n_bw), dtype=np.float32)
+    sigmas   = []
+
+    for bi in range(n_bh):
+        for bj in range(n_bw):
+            y1 = bi * bloc_size; y2 = min(h, y1 + bloc_size)
+            x1 = bj * bloc_size; x2 = min(w, x1 + bloc_size)
+            bloc    = depth_f[y1:y2, x1:x2]
+            n_total = bloc.size
+            valides = bloc[(bloc > 100) & (bloc < 15000)]
+            n_val   = valides.size
+
+            if n_total == 0:
+                continue
+
+            taux_val = n_val / n_total
+
+            if n_val < 4:
+                carte[bi, bj] = 0.0
+                continue
+
+            sigma = float(np.std(valides))
+            sigmas.append(sigma)
+
+            # Speckle résiduel : pixels valides très éloignés de la médiane locale
+            med_loc = float(np.median(valides))
+            speckle = float(np.mean(np.abs(valides - med_loc) > 3 * sigma + 1))
+
+            # Score : taux_valides pondéré par stabilité et absence de speckle
+            stabilite   = max(0.0, 1.0 - sigma / 300.0)   # σ < 300mm → stable
+            score = taux_val * stabilite * (1.0 - speckle)
+            carte[bi, bj] = float(np.clip(score, 0, 1))
+
+    sigma_median       = float(np.median(sigmas)) if sigmas else 999.0
+    taux_valide_global = float(np.mean(
+        (depth_f > 100) & (depth_f < 15000)))
+
+    # Seuils σ adaptatifs — si la depth map est globalement bruitée
+    # on assouplit les critères de détection des plans
+    facteur_bruit  = max(1.0, sigma_median / 30.0)
+    seuil_sigma_h  = float(np.clip(40.0  * facteur_bruit, 40,  150))
+    seuil_sigma_v  = float(np.clip(60.0  * facteur_bruit, 60,  200))
+
+    # Carte pleine résolution (upscale nearest)
+    carte_full = cv2.resize(carte, (w, h),
+                            interpolation=cv2.INTER_NEAREST)
+    zones_fiables = carte_full > 0.4
+
+    return {
+        "carte_fiabilite"   : carte,          # grille basse résolution
+        "carte_full"        : carte_full,      # pleine résolution
+        "sigma_median"      : round(sigma_median, 1),
+        "taux_valide_global": round(taux_valide_global, 3),
+        "zones_fiables"     : zones_fiables,
+        "seuil_sigma_h"     : round(seuil_sigma_h, 1),
+        "seuil_sigma_v"     : round(seuil_sigma_v, 1),
+    }
+
+
+def afficher_carte_fiabilite(canvas: np.ndarray,
+                              qualite: dict,
+                              alpha: float = 0.25) -> np.ndarray:
+    """
+    Superpose la carte de fiabilité depth en overlay semi-transparent.
+    Rouge = peu fiable, vert = fiable.
+    """
+    if qualite["carte_fiabilite"] is None:
+        return canvas
+
+    h, w     = canvas.shape[:2]
+    carte_u8 = (qualite["carte_full"] * 255).astype(np.uint8)
+    carte_u8 = cv2.resize(carte_u8, (w, h), interpolation=cv2.INTER_NEAREST)
+    # Colormap : 0=rouge (peu fiable) → 255=vert (fiable)
+    # On utilise COLORMAP_RdYlGn via une LUT manuelle
+    heatmap  = cv2.applyColorMap(carte_u8, cv2.COLORMAP_RdYlGn
+                                 if hasattr(cv2, 'COLORMAP_RdYlGn')
+                                 else cv2.COLORMAP_JET)
+    return cv2.addWeighted(canvas, 1-alpha, heatmap, alpha, 0)
+
+# ─────────────────────────────────────────────────────────────
+#  DÉTECTION DE PLANS / SURFACES
+# ─────────────────────────────────────────────────────────────
+
+# Focale approximative OAK-D Lite (pixels) — à affiner par calibration
+FOCALE_PX      = 500.0
+# Surface minimale en mm (30cm × 30cm)
+SURFACE_MIN_MM = 300.0
+
+
+def px_to_mm(n_pixels: int, z_mm: float) -> float:
+    """Convertit un nombre de pixels en mm réels selon la distance Z."""
+    if FOCALE_PX <= 0 or z_mm <= 0:
+        return 0.0
+    return (n_pixels * z_mm) / FOCALE_PX
+
+
+def detecter_plans_horizontaux(depth_map: np.ndarray | None,
+                                sigma_max: float = 40.0,
+                                zones_fiables: np.ndarray | None = None) -> list:
+    """
+    Détecte les surfaces horizontales planes (sol, table, plafond).
+
+    Méthode :
+      - Découpe la depth map en blocs
+      - Pour chaque bloc : si std_Z < sigma_max → surface plane candidate
+      - Convertit la taille du bloc en mm réels via la profondeur médiane
+      - Garde uniquement les blocs >= SURFACE_MIN_MM × SURFACE_MIN_MM
+
+    Retourne une liste de surfaces :
+    {
+        "type"      : "horizontal"
+        "bbox_px"   : (x1, y1, x2, y2)
+        "z_median"  : float mm
+        "taille_mm" : (largeur_mm, hauteur_mm)
+        "confiance" : float [0,1]
+    }
+    """
+    if depth_map is None:
+        return []
+
+    h, w   = depth_map.shape
+    surfaces = []
+
+    # Taille de bloc adaptative — ~10% de l'image
+    bloc_h = max(10, h // 10)
+    bloc_w = max(10, w // 10)
+
+    for y in range(0, h - bloc_h, bloc_h // 2):
+        for x in range(0, w - bloc_w, bloc_w // 2):
+            bloc = depth_map[y:y+bloc_h, x:x+bloc_w].astype(np.float32)
+            valides = bloc[(bloc > 100) & (bloc < 15000)]
+
+            if valides.size < bloc_h * bloc_w * 0.4:
+                continue   # trop de trous
+
+            z_med   = float(np.median(valides))
+            sigma_z = float(np.std(valides))
+
+            if sigma_z > sigma_max:
+                continue   # surface non plane
+
+            # Vérifier que la zone est fiable selon la carte qualité
+            if zones_fiables is not None:
+                zone_fid = zones_fiables[y:y+bloc_h, x:x+bloc_w]
+                if float(zone_fid.mean()) < 0.3:
+                    continue   # zone trop peu fiable — on ignore
+
+            # Conversion pixels → mm
+            larg_mm   = px_to_mm(bloc_w, z_med)
+            haut_mm   = px_to_mm(bloc_h, z_med)
+
+            if larg_mm < SURFACE_MIN_MM or haut_mm < SURFACE_MIN_MM:
+                continue   # trop petit
+
+            # Confiance : inversement proportionnel à sigma_z
+            confiance = float(max(0.0, 1.0 - sigma_z / sigma_max))
+
+            surfaces.append({
+                "type"     : "horizontal",
+                "bbox_px"  : (int(x), int(y), int(x+bloc_w), int(y+bloc_h)),
+                "z_median" : round(z_med, 1),
+                "taille_mm": (round(larg_mm), round(haut_mm)),
+                "confiance": round(confiance, 2),
+            })
+
+    # Fusionner les blocs adjacents de même Z (±50mm)
+    surfaces = _fusionner_surfaces(surfaces, z_tol=50.0)
+
+    return surfaces
+
+
+def detecter_plans_verticaux(depth_map: np.ndarray | None,
+                              sigma_max: float = 60.0,
+                              zones_fiables: np.ndarray | None = None) -> list:
+    """
+    Détecte les surfaces verticales planes (murs, portes).
+
+    Méthode :
+      - Analyse des colonnes verticales de la depth map
+      - Un mur = colonne où Z est constant sur une grande hauteur
+        MAIS varie latéralement (gradient horizontal fort)
+      - Regroupement des colonnes adjacentes de même Z
+
+    Retourne une liste de surfaces :
+    {
+        "type"      : "vertical"
+        "bbox_px"   : (x1, y1, x2, y2)
+        "z_median"  : float mm
+        "taille_mm" : (largeur_mm, hauteur_mm)
+        "confiance" : float [0,1]
+        "normale"   : "gauche" | "droite" | "face"
+    }
+    """
+    if depth_map is None:
+        return []
+
+    h, w     = depth_map.shape
+    depth_f  = depth_map.astype(np.float32)
+    surfaces = []
+
+    bloc_h = max(10, h // 5)    # blocs plus hauts pour les murs
+    bloc_w = max(10, w // 10)
+
+    for x in range(0, w - bloc_w, bloc_w // 2):
+        for y in range(0, h - bloc_h, bloc_h // 2):
+            bloc = depth_f[y:y+bloc_h, x:x+bloc_w]
+            valides = bloc[(bloc > 100) & (bloc < 15000)]
+
+            if valides.size < bloc_h * bloc_w * 0.4:
+                continue
+
+            z_med   = float(np.median(valides))
+            sigma_z = float(np.std(valides))
+
+            if sigma_z > sigma_max:
+                continue   # pas assez plan
+
+            if zones_fiables is not None:
+                zone_fid = zones_fiables[y:y+bloc_h, x:x+bloc_w]
+                if float(zone_fid.mean()) < 0.3:
+                    continue
+
+            # Gradient horizontal : un mur a un fort gradient Z latéral
+            # par rapport aux blocs voisins
+            grad_lateral = 0.0
+            if x > 0:
+                bloc_gauche = depth_f[y:y+bloc_h, max(0,x-bloc_w):x]
+                val_g = bloc_gauche[(bloc_gauche > 100) & (bloc_gauche < 15000)]
+                if val_g.size > 0:
+                    grad_lateral = abs(float(np.median(val_g)) - z_med)
+
+            # Conversion pixels → mm
+            larg_mm = px_to_mm(bloc_w, z_med)
+            haut_mm = px_to_mm(bloc_h, z_med)
+
+            if larg_mm < SURFACE_MIN_MM or haut_mm < SURFACE_MIN_MM:
+                continue
+
+            # Orientation approximative du mur
+            if grad_lateral > 200:
+                normale = "gauche" if x < w//2 else "droite"
+            else:
+                normale = "face"
+
+            confiance = float(max(0.0, 1.0 - sigma_z / sigma_max))
+
+            surfaces.append({
+                "type"     : "vertical",
+                "bbox_px"  : (int(x), int(y), int(x+bloc_w), int(y+bloc_h)),
+                "z_median" : round(z_med, 1),
+                "taille_mm": (round(larg_mm), round(haut_mm)),
+                "confiance": round(confiance, 2),
+                "normale"  : normale,
+            })
+
+    surfaces = _fusionner_surfaces(surfaces, z_tol=80.0)
+
+    return surfaces
+
+
+def _fusionner_surfaces(surfaces: list, z_tol: float = 50.0) -> list:
+    """
+    Fusionne les blocs adjacents de même type et même Z.
+    Retourne une liste réduite avec les grandes surfaces unifiées.
+    """
+    if not surfaces:
+        return []
+
+    fusionnees = []
+    utilisees  = [False] * len(surfaces)
+
+    for i, s in enumerate(surfaces):
+        if utilisees[i]:
+            continue
+
+        groupe = [s]
+        utilisees[i] = True
+
+        for j, t in enumerate(surfaces):
+            if utilisees[j] or i == j:
+                continue
+            if t["type"] != s["type"]:
+                continue
+            if abs(t["z_median"] - s["z_median"]) > z_tol:
+                continue
+            # Adjacence des bboxes
+            ix1,iy1,ix2,iy2 = s["bbox_px"]
+            jx1,jy1,jx2,jy2 = t["bbox_px"]
+            overlap_x = min(ix2, jx2) > max(ix1, jx1) - 20
+            overlap_y = min(iy2, jy2) > max(iy1, jy1) - 20
+            if overlap_x and overlap_y:
+                groupe.append(t)
+                utilisees[j] = True
+
+        # Bbox englobante du groupe
+        all_x1 = min(g["bbox_px"][0] for g in groupe)
+        all_y1 = min(g["bbox_px"][1] for g in groupe)
+        all_x2 = max(g["bbox_px"][2] for g in groupe)
+        all_y2 = max(g["bbox_px"][3] for g in groupe)
+        z_moy  = float(np.mean([g["z_median"] for g in groupe]))
+        conf   = float(np.mean([g["confiance"] for g in groupe]))
+
+        surf = s.copy()
+        surf["bbox_px"]   = (all_x1, all_y1, all_x2, all_y2)
+        surf["z_median"]  = round(z_moy, 1)
+        surf["confiance"] = round(conf, 2)
+        surf["taille_mm"] = (
+            round(px_to_mm(all_x2-all_x1, z_moy)),
+            round(px_to_mm(all_y2-all_y1, z_moy))
+        )
+        if "normale" not in surf:
+            surf["normale"] = groupe[0].get("normale", "face")
+        fusionnees.append(surf)
+
+    return fusionnees
+
+
+def dessiner_plans(canvas: np.ndarray,
+                   plans_h: list,
+                   plans_v: list):
+    """
+    Dessine les surfaces détectées sur l'overlay.
+    Horizontal → bleu semi-transparent
+    Vertical   → vert semi-transparent, avec indication de la normale
+    """
+    overlay = canvas.copy()
+
+    for p in plans_h:
+        x1, y1, x2, y2 = p["bbox_px"]
+        cv2.rectangle(overlay, (x1,y1), (x2,y2), (200, 100, 0), -1)   # bleu rempli
+        cv2.rectangle(canvas,  (x1,y1), (x2,y2), (200, 100, 0), 1)
+        label = (f"H {p['taille_mm'][0]}x{p['taille_mm'][1]}cm "
+                 f"z:{p['z_median']:.0f}mm c:{p['confiance']:.2f}")
+        cv2.putText(canvas, label, (x1+2, y1+12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, (200,100,0), 1)
+
+    for p in plans_v:
+        x1, y1, x2, y2 = p["bbox_px"]
+        cv2.rectangle(overlay, (x1,y1), (x2,y2), (0, 180, 80), -1)    # vert rempli
+        cv2.rectangle(canvas,  (x1,y1), (x2,y2), (0, 180, 80), 1)
+        label = (f"V({p['normale']}) {p['taille_mm'][0]}x{p['taille_mm'][1]}cm "
+                 f"z:{p['z_median']:.0f}mm")
+        cv2.putText(canvas, label, (x1+2, y1+12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0,180,80), 1)
+
+    cv2.addWeighted(overlay, 0.15, canvas, 0.85, 0, canvas)
+
 # ─────────────────────────────────────────────────────────────
 #  PIPELINE OAK-D
 # ─────────────────────────────────────────────────────────────
-def creer_pipeline():
+def creer_pipeline() -> dai.Pipeline:
     """
-    Pipeline depthai v3.
-    - XLinkOut/XLinkIn supprimés : queues créées directement sur les outputs
-    - Camera node unifié remplace ColorCamera + MonoCamera
-    - pipeline.start() remplace dai.Device(pipeline)
+    Pipeline depthai v2 (API stable, compatible 2.x).
+    Structure validée sur OAK-D Lite.
     """
     pipeline = dai.Pipeline()
 
-    # ── Caméra RGB (nouveau node Camera unifié) ───────────────────────────────
-    cam_rgb = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
-    rgb_out = cam_rgb.requestOutput(
-        (W, H),
-        type=dai.ImgFrame.Type.BGR888p,
-        fps=FPS_ACQ
-    )
+    # ── Mono cams ─────────────────────────────────────────────────────────────
+    mono_l = pipeline.create(dai.node.MonoCamera)
+    mono_r = pipeline.create(dai.node.MonoCamera)
+    mono_l.setBoardSocket(dai.CameraBoardSocket.CAM_B)
+    mono_r.setBoardSocket(dai.CameraBoardSocket.CAM_C)
+    mono_l.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
+    mono_r.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
+    mono_l.setFps(FPS_ACQ)
+    mono_r.setFps(FPS_ACQ)
 
-    # ── Caméras stéréo mono ───────────────────────────────────────────────────
-    mono_l = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
-    mono_r = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C)
-    mono_l_out = mono_l.requestOutput((640, 400), type=dai.ImgFrame.Type.GRAY8, fps=FPS_ACQ)
-    mono_r_out = mono_r.requestOutput((640, 400), type=dai.ImgFrame.Type.GRAY8, fps=FPS_ACQ)
-
-    # ── Depth ─────────────────────────────────────────────────────────────────
+    # ── Stereo depth ──────────────────────────────────────────────────────────
     stereo = pipeline.create(dai.node.StereoDepth)
     stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
     stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)
-    stereo.setOutputSize(W, H)
-    stereo.setSubpixel(True)
+    stereo.setLeftRightCheck(True)
+    stereo.setSubpixel(False)   # OFF → moins de latence visuelle
 
     cfg = stereo.initialConfig.get()
     cfg.postProcessing.speckleFilter.enable            = True
@@ -970,15 +1347,33 @@ def creer_pipeline():
     cfg.postProcessing.thresholdFilter.maxRange        = 8000
     stereo.initialConfig.set(cfg)
 
-    mono_l_out.link(stereo.left)
-    mono_r_out.link(stereo.right)
+    mono_l.out.link(stereo.left)
+    mono_r.out.link(stereo.right)
 
-    # ── Queues de sortie (v3 : directement sur les outputs, sans XLinkOut) ────
-    pipeline._rgb_queue   = rgb_out.createOutputQueue(maxSize=1, blocking=False)
-    pipeline._depth_queue = stereo.depth.createOutputQueue(maxSize=1, blocking=False)
+    # ── RGB ───────────────────────────────────────────────────────────────────
+    cam_rgb = pipeline.create(dai.node.ColorCamera)
+    cam_rgb.setBoardSocket(dai.CameraBoardSocket.CAM_A)
+    cam_rgb.setPreviewSize(W, H)
+    cam_rgb.setFps(FPS_ACQ)
+    cam_rgb.setInterleaved(False)
+    cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
+    # Autofocus désactivé — contrôle manuel périodique
+    cam_rgb.initialControl.setAutoFocusMode(
+        dai.CameraControl.AutoFocusMode.OFF
+    )
 
-    # ── Contrôle caméra (v3 : inputControl queue directement) ────────────────
-    pipeline._ctrl_queue  = cam_rgb.inputControl.createInputQueue()
+    # ── XLink outputs ─────────────────────────────────────────────────────────
+    xout_rgb   = pipeline.create(dai.node.XLinkOut)
+    xout_depth = pipeline.create(dai.node.XLinkOut)
+    xout_rgb.setStreamName("rgb")
+    xout_depth.setStreamName("depth")
+    cam_rgb.preview.link(xout_rgb.input)
+    stereo.depth.link(xout_depth.input)
+
+    # ── Contrôle caméra ───────────────────────────────────────────────────────
+    ctrl_in = pipeline.create(dai.node.XLinkIn)
+    ctrl_in.setStreamName("control")
+    ctrl_in.out.link(cam_rgb.inputControl)
 
     return pipeline
 
@@ -986,37 +1381,45 @@ def creer_pipeline():
 # ─────────────────────────────────────────────────────────────
 #  THREADS ACQUISITION
 # ─────────────────────────────────────────────────────────────
-def thread_acquisition_oak(pipeline, frame_queue, stop_event):
+def thread_acquisition_oak(device, frame_queue, stop_event):
     """
-    Thread d'acquisition v3 — utilise les queues attachées au pipeline.
-    Le pipeline est déjà démarré (pipeline.start()) avant l'appel.
+    Thread d'acquisition v2 — queues via device.getOutputQueue().
+    Synchro temporelle RGB/depth (tolérance 25ms).
     """
-    log_acq.info("Thread OAK-D démarré (depthai v3)")
-    q_rgb   = pipeline._rgb_queue
-    q_depth = pipeline._depth_queue
-    q_ctrl  = pipeline._ctrl_queue
+    log_acq.info(f"Thread OAK-D démarré — depthai {dai.__version__}")
+    q_rgb   = device.getOutputQueue("rgb",     maxSize=4, blocking=True)
+    q_depth = device.getOutputQueue("depth",   maxSize=4, blocking=True)
+    q_ctrl  = device.getInputQueue("control")
 
+    MAX_DT_MS      = 25
     dernier_af     = datetime.now()
     lenspos_actuel = lenspos_cible = 120
     EMA_ALPHA      = 0.25 if IS_PI else 0.35
     depth_ema      = None
 
-    while not stop_event.is_set() and pipeline.isRunning():
+    while not stop_event.is_set():
         try:
-            in_rgb   = q_rgb.tryGet()
-            in_depth = q_depth.tryGet()
-            if in_rgb is None or in_depth is None:
+            in_rgb   = q_rgb.get()
+            in_depth = q_depth.get()
+
+            # Synchro temporelle
+            dt_ms = abs((in_rgb.getTimestamp() - in_depth.getTimestamp())
+                        .total_seconds() * 1000)
+            if dt_ms > MAX_DT_MS:
+                log_acq.debug(f"Frames désynchronisées dt:{dt_ms:.1f}ms — ignorées")
                 continue
 
             frame_bgr = in_rgb.getCvFrame()
             depth_raw = in_depth.getFrame()
             ts        = datetime.now()
 
+            # Vérification focus hardware
             lp = in_rgb.getLensPosition()
             if lp != -1 and abs(lp - lenspos_cible) > 2:
-                log_acq.debug(f"Focus en déplacement lp:{lp} cible:{lenspos_cible} — frame ignorée")
+                log_acq.debug(f"Focus en déplacement lp:{lp} cible:{lenspos_cible}")
                 continue
 
+            # EMA depth
             mask = depth_raw > 0
             if depth_ema is None:
                 depth_ema = depth_raw.astype(np.float32)
@@ -1025,6 +1428,7 @@ def thread_acquisition_oak(pipeline, frame_queue, stop_event):
                                    + (1 - EMA_ALPHA) * depth_ema[mask])
             depth_final = np.clip(depth_ema, 0, 65535).astype(np.uint16)
 
+            # Recalibration autofocus périodique
             if (ts - dernier_af).total_seconds() >= AF_PERIODE_S:
                 dist_mm = distance_mediane_centrale(depth_final)
                 nlp     = distance_vers_lenspos(dist_mm)
@@ -1033,8 +1437,8 @@ def thread_acquisition_oak(pipeline, frame_queue, stop_event):
                     ctrl.setManualFocus(nlp)
                     q_ctrl.send(ctrl)
                     lenspos_actuel = lenspos_cible = nlp
-                    depth_ema      = None
-                    log_acq.info(f"AF recalibré → lenspos:{nlp}  dist:{dist_mm:.0f}mm")
+                    depth_ema = None
+                    log_acq.info(f"AF → lenspos:{nlp}  dist:{dist_mm:.0f}mm")
                 dernier_af = ts
 
             if frame_queue.full():
@@ -1092,9 +1496,9 @@ if __name__ == "__main__":
     if USE_OAKD:
         try:
             pipeline = creer_pipeline()
-            pipeline.start()   # v3 : démarre le pipeline (remplace dai.Device(pipeline))
+            device   = dai.Device(pipeline)
             t_acq    = threading.Thread(target=thread_acquisition_oak,
-                                        args=(pipeline, frame_queue, stop_event),
+                                        args=(device, frame_queue, stop_event),
                                         daemon=True, name="Acq-OAK")
         except Exception as e:
             log.error(f"Impossible d'ouvrir l'OAK-D : {e} — fallback webcam")
@@ -1109,6 +1513,8 @@ if __name__ == "__main__":
     mode_analyse = False
     derniere_frame = avant_derniere = derniere_depth = resultats_analyse = None
     show_heatmap   = False
+    show_fiabilite = False
+    qualite_depth  = qualifier_depth(None)
 
     log.info("ESPACE:analyser  H:heatmap  Q:quitter")
 
@@ -1127,7 +1533,7 @@ if __name__ == "__main__":
             affichage = resultats_analyse
         elif derniere_frame is not None:
             affichage = derniere_frame.copy()
-            cv2.putText(affichage, "ESPACE:analyser  H:heatmap  Q:quitter",
+            cv2.putText(affichage, "ESPACE:analyser  H:heatmap  F:fiabilité  Q:quitter",
                         (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,255,0), 1)
         else:
             continue
@@ -1142,6 +1548,10 @@ if __name__ == "__main__":
         elif key == ord('h'):
             show_heatmap = not show_heatmap
             log_ui.debug(f"Heatmap : {show_heatmap}")
+
+        elif key == ord('f'):
+            show_fiabilite = not show_fiabilite
+            log_ui.debug(f"Fiabilité depth : {show_fiabilite}")
 
         elif key == ord(' '):
             if not mode_analyse and derniere_frame is not None:
@@ -1170,22 +1580,42 @@ if __name__ == "__main__":
                     sol, plafond = plans["sol"], plans["plafond"]
                     log_plan.debug(f"Plans — sol:{sol}mm  plafond:{plafond}mm")
 
-                    # Lignes structurelles
+                    # Qualification depth map + lignes + plans en parallèle
                     if derniere_depth is not None:
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+                        # Qualification d'abord — fournit les seuils adaptatifs
+                        qualite_depth = qualifier_depth(derniere_depth)
+                        z_fid  = qualite_depth["zones_fiables"]
+                        sig_h  = qualite_depth["seuil_sigma_h"]
+                        sig_v  = qualite_depth["seuil_sigma_v"]
+                        log_plan.debug(
+                            f"Depth qualité : σ_med:{qualite_depth['sigma_median']}mm  "
+                            f"valides:{qualite_depth['taux_valide_global']:.0%}  "
+                            f"seuils H:{sig_h}mm V:{sig_v}mm")
+
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
                             f_lv = ex.submit(detecter_lignes_verticales,
                                              derniere_depth, sol, plafond)
                             f_lh = ex.submit(detecter_lignes_horizontales,
                                              derniere_depth, sol, plafond)
-                        lignes_v = f_lv.result()
-                        lignes_h = f_lh.result()
+                            f_ph = ex.submit(detecter_plans_horizontaux,
+                                             derniere_depth, sig_h, z_fid)
+                            f_pv = ex.submit(detecter_plans_verticaux,
+                                             derniere_depth, sig_v, z_fid)
+                        lignes_v      = f_lv.result()
+                        lignes_h      = f_lh.result()
+                        plans_h       = f_ph.result()
+                        plans_v       = f_pv.result()
                         intersections = detecter_intersections_3d(
                             derniere_depth, sol, plafond, lignes_v, lignes_h)
                     else:
+                        qualite_depth = qualifier_depth(None)
                         lignes_v = lignes_h = intersections = []
+                        plans_h  = plans_v  = []
 
                     # Affichage
                     affichage = derniere_frame.copy()
+                    if show_fiabilite and qualite_depth["carte_fiabilite"] is not None:
+                        affichage = afficher_carte_fiabilite(affichage, qualite_depth)
                     if show_heatmap:
                         fs = cv2.resize(derniere_frame,
                                         (max(1,W//DIV_RETINE), max(1,H//DIV_RETINE)),
@@ -1193,6 +1623,7 @@ if __name__ == "__main__":
                         affichage = afficher_heatmap(affichage, carte_saillance_gem(fs))
 
                     if pois:
+                        dessiner_plans(affichage, plans_h, plans_v)
                         dessiner_chemin_attentionnel(affichage, pois)
                         dessiner_lignes_structures(affichage, lignes_v, lignes_h, intersections)
                         if pois[0].get("slam"):
@@ -1213,7 +1644,8 @@ if __name__ == "__main__":
 
                         log_plan.info(
                             f"Structures : {len(lignes_v)}V  "
-                            f"{len(lignes_h)}H  {len(intersections)} intersections")
+                            f"{len(lignes_h)}H  {len(intersections)} intersections  "
+                            f"| Plans : {len(plans_h)}H  {len(plans_v)}V")
 
                         # Debug segmentation POI #1
                         p0  = pois[0]
@@ -1301,10 +1733,10 @@ if __name__ == "__main__":
 
     if USE_OAKD:
         try:
-            pipeline.stop()   # v3 : arrêt propre du pipeline
-            log.info("Pipeline OAK-D arrêté")
+            device.close()
+            log.info("OAK-D fermé")
         except Exception as e:
-            log.error(f"Erreur fermeture pipeline OAK-D : {e}")
+            log.error(f"Erreur fermeture OAK-D : {e}")
 
     cv2.destroyAllWindows()
     log.info("Arrêt propre.")
