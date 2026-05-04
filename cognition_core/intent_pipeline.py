@@ -14,12 +14,18 @@ Composants intégrés :
   - Événements (action, acteur, patient, instrument)
   - Quantifieurs, négations, modalités, comparaisons, rôles
   - Propositions subordonnées, intentions secondaires, temps relatifs
+  - Actions programmées (dans X, à Xh, le X, ce soir)
   - Résolution temporelle française (saisons, vacances, jours fériés)
+  - Discours rapporté (X dit que Y)
+  - Rôles contextuels (en tant que)
+  - Entités collectives (équipe, groupe)
+  - Comparaisons complexes (superlatifs, quantités)
+  - Modalités composées (aurait dû, aurait pu)
   - Exports triplets RDF pour CognitionCore
   - Imports optionnels, fallbacks, cache LRU
   - Multi-intent (split_clauses)
   - Contexte conversationnel (ellipses, pronoms)
-  - Thread-safe (File d'attente, batch optionnel)
+  - Thread-safe (File d'attente)
 
 Dépendances minimales :
     pip install spacy numpy dateparser python-dateutil workalendar
@@ -111,7 +117,7 @@ error_logger.setLevel(logging.WARNING)
 IntentType = Literal["query_narrative", "query_state", "query_intention",
                       "action_device", "information_input", "chit_chat",
                       "reminder", "warning", "condition", "suggestion", "obligation",
-                      "scheduled_action"]  # NOUVEAU
+                      "scheduled_action"]
 TenseType = Literal["past", "present", "future", "conditional", "unknown"]
 PersonType = Literal["1st_sg", "2nd_sg", "3rd_sg", "1st_pl", "2nd_pl", "3rd_pl", "unknown"]
 MoodType = Literal["indicative", "subjunctive", "imperative", "conditional", "infinitive"]
@@ -213,18 +219,17 @@ TUTOIEMENT_MARKERS = {"tu", "toi", "t'", "te"}
 VOUVOIEMENT_MARKERS = {"vous", "votre", "vos"}
 
 # ============================================================
-# NOUVELLES STRUCTURES
+# STRUCTURES POUR GRAPHE MÉMOIRE
 # ============================================================
 
 @dataclass
 class ScheduledTime:
-    """Informations de temps programmé pour une action."""
     raw: str
     iso: str
     human: str
     delay_seconds: Optional[int] = None
     is_recurring: bool = False
-    recurrence_rule: Optional[str] = None  # "daily", "weekly", "monthly"
+    recurrence_rule: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -431,6 +436,65 @@ class RelativeTense:
 
 
 # ============================================================
+# NOUVELLES STRUCTURES (Discours rapporté, rôles contextuels, etc.)
+# ============================================================
+
+@dataclass
+class ReportedSpeech:
+    """Discours rapporté (il a dit que...)."""
+    speaker: str
+    verb: str
+    content: str
+    content_intent: Optional[IntentType] = None
+    relation: str = "said"
+    confidence: float = 0.85
+    source_text: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class ContextualRole:
+    """Rôle contextuel d'une entité (ex: 'en tant que président')."""
+    entity: str
+    role: str
+    context_phrase: str
+    temporal: Optional[str] = None
+    confidence: float = 0.85
+    source_text: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class CollectiveEntity:
+    """Entité collective (équipe, groupe, famille)."""
+    name: str
+    members: List[str]
+    collective_type: str
+    confidence: float = 0.85
+    source_text: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class CompoundModality:
+    """Modalité composée (aurait dû, aurait pu)."""
+    statement: str
+    base_modality: str
+    tense: str
+    strength: float
+    source_text: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+# ============================================================
 # STRUCTURES EXISTANTES
 # ============================================================
 
@@ -464,7 +528,7 @@ class TemporalSpan:
     interval_start_raw: Optional[str] = None
     interval_end_raw: Optional[str] = None
     named_event: Optional[dict] = None
-    scheduled: Optional[ScheduledTime] = None  # NOUVEAU
+    scheduled: Optional[ScheduledTime] = None
 
 
 @dataclass
@@ -484,7 +548,7 @@ class RegisterAnalysis:
     style: str = "neutre"
     confidence: float = 0.5
     markers: List[str] = field(default_factory=list)
-    politeness: bool = False  # NOUVEAU
+    politeness: bool = False
 
 
 # ============================================================
@@ -493,7 +557,6 @@ class RegisterAnalysis:
 
 @dataclass
 class Intent:
-    # Champs existants
     text: str
     intent: IntentType
     confidence: float
@@ -519,7 +582,6 @@ class Intent:
     processing_ms: float = 0.0
     ts: float = field(default_factory=time.time)
 
-    # Nouveaux champs pour graphe mémoire
     relations: List[Relation] = field(default_factory=list)
     triplets: List[Tuple[str, str, str]] = field(default_factory=list)
     coreferences: List[Coreference] = field(default_factory=list)
@@ -534,7 +596,14 @@ class Intent:
     subordinate_clauses: List[SubordinateClause] = field(default_factory=list)
     secondary_intents: List[SecondaryIntent] = field(default_factory=list)
     relative_tenses: List[RelativeTense] = field(default_factory=list)
-    scheduled_time: Optional[ScheduledTime] = None  # NOUVEAU
+    scheduled_time: Optional[ScheduledTime] = None
+    
+    # NOUVEAUX CHAMPS
+    reported_speeches: List[ReportedSpeech] = field(default_factory=list)
+    contextual_roles: List[ContextualRole] = field(default_factory=list)
+    collective_entities: List[CollectiveEntity] = field(default_factory=list)
+    compound_modalities: List[CompoundModality] = field(default_factory=list)
+    
     entities_set: Set[str] = field(default_factory=set)
     facts: Set[str] = field(default_factory=set)
 
@@ -553,6 +622,10 @@ class Intent:
         d["subordinate_clauses"] = [s.to_dict() for s in self.subordinate_clauses]
         d["secondary_intents"] = [s.to_dict() for s in self.secondary_intents]
         d["relative_tenses"] = [r.to_dict() for r in self.relative_tenses]
+        d["reported_speeches"] = [r.to_dict() for r in self.reported_speeches]
+        d["contextual_roles"] = [c.to_dict() for c in self.contextual_roles]
+        d["collective_entities"] = [c.to_dict() for c in self.collective_entities]
+        d["compound_modalities"] = [c.to_dict() for c in self.compound_modalities]
         if self.scheduled_time:
             d["scheduled_time"] = self.scheduled_time.to_dict()
         d["entities_set"] = list(self.entities_set)
@@ -591,6 +664,10 @@ class Intent:
             "subordinate_clauses": [s.to_dict() for s in self.subordinate_clauses],
             "secondary_intents": [s.to_dict() for s in self.secondary_intents],
             "relative_tenses": [r.to_dict() for r in self.relative_tenses],
+            "reported_speeches": [r.to_dict() for r in self.reported_speeches],
+            "contextual_roles": [c.to_dict() for c in self.contextual_roles],
+            "collective_entities": [c.to_dict() for c in self.collective_entities],
+            "compound_modalities": [c.to_dict() for c in self.compound_modalities],
             "entities": list(self.entities_set),
             "facts": list(self.facts),
         }
@@ -645,7 +722,6 @@ class ScheduledTimeExtractor:
         
         text_lower = text.lower()
         
-        # Vérifier si c'est récurrent
         is_recurring = False
         recurrence_rule = None
         for pattern, rule in cls.RECURRING_PATTERNS:
@@ -654,13 +730,11 @@ class ScheduledTimeExtractor:
                 recurrence_rule = rule
                 break
         
-        # Délais
         for pattern in cls.DELAY_PATTERNS:
             match = re.search(pattern, text_lower)
             if match:
                 return cls._parse_delay(match, ref, is_recurring, recurrence_rule)
         
-        # Dates absolues
         for pattern in cls.ABSOLUTE_PATTERNS:
             match = re.search(pattern, text_lower)
             if match:
@@ -673,7 +747,6 @@ class ScheduledTimeExtractor:
         groups = match.groups()
         raw = match.group(0)
         
-        # Cas "dans 2h30"
         if len(groups) >= 2 and groups[1] and groups[0] and not groups[0].isalpha():
             try:
                 hours = int(groups[0])
@@ -681,44 +754,36 @@ class ScheduledTimeExtractor:
                 total_seconds = hours * 3600 + mins * 60
                 target = ref + datetime.timedelta(seconds=total_seconds)
                 return ScheduledTime(
-                    raw=raw,
-                    iso=target.isoformat(),
+                    raw=raw, iso=target.isoformat(),
                     human=target.strftime("%A %d %B %Y à %H:%M"),
                     delay_seconds=total_seconds,
-                    is_recurring=is_recurring,
-                    recurrence_rule=recurrence_rule,
+                    is_recurring=is_recurring, recurrence_rule=recurrence_rule,
                 )
             except (ValueError, TypeError):
                 pass
         
-        # Cas "dans une heure"
         if groups[0] in ("une", "un"):
             unit = groups[1] if len(groups) > 1 else groups[0]
             unit_clean = unit.rstrip("s")
             seconds = cls.TIME_UNITS.get(unit_clean, 0)
             target = ref + datetime.timedelta(seconds=seconds)
             return ScheduledTime(
-                raw=raw,
-                iso=target.isoformat(),
+                raw=raw, iso=target.isoformat(),
                 human=target.strftime("%A %d %B %Y à %H:%M"),
                 delay_seconds=seconds,
-                is_recurring=is_recurring,
-                recurrence_rule=recurrence_rule,
+                is_recurring=is_recurring, recurrence_rule=recurrence_rule,
             )
         
-        # Cas "dans 20 minutes"
         try:
             value = float(groups[0].replace(",", "."))
             unit = groups[1].rstrip("s")
             seconds = int(value * cls.TIME_UNITS.get(unit, 0))
             target = ref + datetime.timedelta(seconds=seconds)
             return ScheduledTime(
-                raw=raw,
-                iso=target.isoformat(),
+                raw=raw, iso=target.isoformat(),
                 human=target.strftime("%A %d %B %Y à %H:%M"),
                 delay_seconds=seconds,
-                is_recurring=is_recurring,
-                recurrence_rule=recurrence_rule,
+                is_recurring=is_recurring, recurrence_rule=recurrence_rule,
             )
         except (ValueError, TypeError, KeyError):
             pass
@@ -730,31 +795,25 @@ class ScheduledTimeExtractor:
         groups = match.groups()
         raw = match.group(0)
         
-        # Cas "demain à 20h30"
         if "demain" in raw.lower():
             target = ref + datetime.timedelta(days=1)
             hour = int(groups[0]) if groups[0] else 20
             minute = int(groups[1]) if len(groups) > 1 and groups[1] else 0
             target = target.replace(hour=hour, minute=minute, second=0, microsecond=0)
             return ScheduledTime(
-                raw=raw,
-                iso=target.isoformat(),
+                raw=raw, iso=target.isoformat(),
                 human=target.strftime("%A %d %B %Y à %H:%M"),
-                is_recurring=is_recurring,
-                recurrence_rule=recurrence_rule,
+                is_recurring=is_recurring, recurrence_rule=recurrence_rule,
             )
         
-        # Cas "ce soir" / "ce matin" / "cet après-midi"
         if "ce soir" in raw.lower():
             target = ref.replace(hour=20, minute=0, second=0, microsecond=0)
             if target < ref:
                 target += datetime.timedelta(days=1)
             return ScheduledTime(
-                raw=raw,
-                iso=target.isoformat(),
+                raw=raw, iso=target.isoformat(),
                 human=target.strftime("%A %d %B %Y à %H:%M"),
-                is_recurring=is_recurring,
-                recurrence_rule=recurrence_rule,
+                is_recurring=is_recurring, recurrence_rule=recurrence_rule,
             )
         
         if "ce matin" in raw.lower():
@@ -762,11 +821,9 @@ class ScheduledTimeExtractor:
             if target < ref:
                 target += datetime.timedelta(days=1)
             return ScheduledTime(
-                raw=raw,
-                iso=target.isoformat(),
+                raw=raw, iso=target.isoformat(),
                 human=target.strftime("%A %d %B %Y à %H:%M"),
-                is_recurring=is_recurring,
-                recurrence_rule=recurrence_rule,
+                is_recurring=is_recurring, recurrence_rule=recurrence_rule,
             )
         
         if "cet après-midi" in raw.lower():
@@ -774,14 +831,11 @@ class ScheduledTimeExtractor:
             if target < ref:
                 target += datetime.timedelta(days=1)
             return ScheduledTime(
-                raw=raw,
-                iso=target.isoformat(),
+                raw=raw, iso=target.isoformat(),
                 human=target.strftime("%A %d %B %Y à %H:%M"),
-                is_recurring=is_recurring,
-                recurrence_rule=recurrence_rule,
+                is_recurring=is_recurring, recurrence_rule=recurrence_rule,
             )
         
-        # Cas "à 20h30" ou "20h30"
         if len(groups) >= 2 and groups[0] and groups[0].isdigit() and len(groups[0]) <= 2:
             hour = int(groups[0])
             minute = int(groups[1]) if groups[1] else 0
@@ -789,14 +843,11 @@ class ScheduledTimeExtractor:
             if target < ref:
                 target += datetime.timedelta(days=1)
             return ScheduledTime(
-                raw=raw,
-                iso=target.isoformat(),
+                raw=raw, iso=target.isoformat(),
                 human=target.strftime("%A %d %B %Y à %H:%M"),
-                is_recurring=is_recurring,
-                recurrence_rule=recurrence_rule,
+                is_recurring=is_recurring, recurrence_rule=recurrence_rule,
             )
         
-        # Cas date complète
         if len(groups) >= 3 and groups[0]:
             date_str = groups[0]
             hour = int(groups[2]) if len(groups) > 2 and groups[2] else 0
@@ -807,19 +858,15 @@ class ScheduledTimeExtractor:
                 if dt:
                     target = dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
                     return ScheduledTime(
-                        raw=raw,
-                        iso=target.isoformat(),
+                        raw=raw, iso=target.isoformat(),
                         human=target.strftime("%A %d %B %Y à %H:%M"),
-                        is_recurring=is_recurring,
-                        recurrence_rule=recurrence_rule,
+                        is_recurring=is_recurring, recurrence_rule=recurrence_rule,
                     )
         
         return None
 
 
 class RelationExtractor:
-    """Extrait les relations sémantiques."""
-    
     FR_TO_PREDICATE = {
         "fils": "SON_OF", "fille": "DAUGHTER_OF", "père": "FATHER_OF",
         "mère": "MOTHER_OF", "frère": "BROTHER_OF", "soeur": "SISTER_OF",
@@ -1056,8 +1103,6 @@ class RelationExtractor:
 
 
 class CoreferenceExtractor:
-    """Extrait les coréférences."""
-    
     PRONOUNS = {
         "il": {"gender": "M", "number": "S", "type": "subject"},
         "elle": {"gender": "F", "number": "S", "type": "subject"},
@@ -1095,7 +1140,6 @@ class CoreferenceExtractor:
             coreferences.extend(cls._simple_coreference(doc))
         
         coreferences.extend(cls._object_pronoun_coreference(doc))
-        
         return coreferences
     
     @classmethod
@@ -1123,13 +1167,11 @@ class CoreferenceExtractor:
                             confidence=confidence,
                         ))
                         break
-        
         return coreferences
     
     @classmethod
     def _object_pronoun_coreference(cls, doc) -> List[Coreference]:
         coreferences = []
-        
         for token in doc:
             if token.pos_ == "PRON" and token.text.lower() in ("le", "la", "les", "lui", "leur"):
                 for verb in doc:
@@ -1144,13 +1186,10 @@ class CoreferenceExtractor:
                                     confidence=0.85,
                                 ))
                                 return coreferences
-        
         return coreferences
 
 
 class AttributeExtractor:
-    """Extrait les attributs des entités."""
-    
     @classmethod
     def extract(cls, doc) -> List[Attribute]:
         attributes = []
@@ -1169,20 +1208,16 @@ class AttributeExtractor:
                     attributes.append(Attribute(
                         entity=subject, attribute=attr,
                         attribute_type="state" if attr in ("fatigué", "heureux", "triste") else "quality",
-                        is_temporary=is_temporary,
-                        is_epithet=False,
+                        is_temporary=is_temporary, is_epithet=False,
                         source_text=f"{subject} {token.text} {attr}"
                     ))
         
         for token in doc:
             if token.dep_ == "amod":
                 attributes.append(Attribute(
-                    entity=token.head.text,
-                    attribute=token.text,
-                    attribute_type="quality",
-                    confidence=0.85,
-                    is_temporary=False,
-                    is_epithet=True,
+                    entity=token.head.text, attribute=token.text,
+                    attribute_type="quality", confidence=0.85,
+                    is_temporary=False, is_epithet=True,
                     source_text=f"{token.head.text} {token.text}"
                 ))
         
@@ -1191,22 +1226,16 @@ class AttributeExtractor:
                 for child in token.head.children:
                     if child.pos_ in ("NOUN", "PROPN"):
                         attributes.append(Attribute(
-                            entity=child.text,
-                            attribute=token.text,
-                            attribute_type="quality",
-                            confidence=0.75,
-                            is_temporary=True,
-                            is_epithet=False,
+                            entity=child.text, attribute=token.text,
+                            attribute_type="quality", confidence=0.75,
+                            is_temporary=True, is_epithet=False,
                             source_text=f"{child.text} {token.text}"
                         ))
                         break
-        
         return attributes
 
 
 class EventExtractor:
-    """Extrait les événements avec instrument."""
-    
     @classmethod
     def extract(cls, doc) -> List[Event]:
         events = []
@@ -1238,20 +1267,14 @@ class EventExtractor:
                         time = ent.text
                 
                 events.append(Event(
-                    action=token.lemma_,
-                    actor=actor,
-                    patient=patient,
-                    instrument=instrument,
-                    location=location,
-                    time=time,
+                    action=token.lemma_, actor=actor, patient=patient,
+                    instrument=instrument, location=location, time=time,
                     source_text=token.text
                 ))
         return events
 
 
 class SubordinateClauseExtractor:
-    """Extrait les propositions subordonnées."""
-    
     SUBORDINATE_CONJUNCTIONS = {
         "parce que": "cause", "car": "cause", "puisque": "cause",
         "bien que": "concession", "quoique": "concession", "même si": "concession",
@@ -1276,17 +1299,13 @@ class SubordinateClauseExtractor:
                         break
                 if main_clause and sub_clause:
                     clauses.append(SubordinateClause(
-                        main_clause=main_clause,
-                        sub_clause=sub_clause,
-                        relation=relation,
+                        main_clause=main_clause, sub_clause=sub_clause, relation=relation,
                         source_text=token.text,
                     ))
         return clauses
 
 
 class SecondaryIntentExtractor:
-    """Extrait les intentions secondaires."""
-    
     SECONDARY_TYPES = {
         "reminder": ["rappelle-moi", "souviens-toi", "pense à", "n'oublie pas de"],
         "scheduled_action": ["dans", "le", "à", "demain", "ce soir", "ce matin", "cet après-midi"],
@@ -1306,15 +1325,11 @@ class SecondaryIntentExtractor:
                 if trigger in text_lower:
                     action, target = cls._extract_action_target(doc)
                     intents.append(SecondaryIntent(
-                        primary_intent=primary_intent,
-                        secondary_intent=intent_type,
-                        trigger=trigger,
-                        action=action,
-                        target=target,
+                        primary_intent=primary_intent, secondary_intent=intent_type,
+                        trigger=trigger, action=action, target=target,
                         scheduled_time=scheduled_time,
                         confidence=0.85 if action else 0.7,
                     ))
-        
         return intents
     
     @classmethod
@@ -1332,8 +1347,6 @@ class SecondaryIntentExtractor:
 
 
 class RelativeTenseExtractor:
-    """Extrait les temps relatifs entre événements."""
-    
     TENSE_MARKERS = {
         "avant": "before", "avant que": "before", "avant de": "before",
         "après": "after", "après que": "after", "après avoir": "after",
@@ -1346,42 +1359,31 @@ class RelativeTenseExtractor:
     @classmethod
     def extract(cls, doc) -> List[RelativeTense]:
         tenses = []
-        
         for i, token in enumerate(doc):
             marker = None
             for m in cls.TENSE_MARKERS:
                 if m in token.text.lower() or (i + 1 < len(doc) and f"{token.text.lower()} {doc[i+1].text.lower()}" == m):
                     marker = m
                     break
-            
             if marker:
                 relation = cls.TENSE_MARKERS[marker]
                 before_event = cls._find_event_before(doc, token.i)
                 after_event = cls._find_event_after(doc, token.i)
-                
                 if before_event and after_event:
                     tenses.append(RelativeTense(
-                        before_event=before_event,
-                        after_event=after_event,
-                        relation=relation,
-                        time_gap=cls._extract_time_gap(doc, token.i),
-                        confidence=0.85,
+                        before_event=before_event, after_event=after_event, relation=relation,
+                        time_gap=cls._extract_time_gap(doc, token.i), confidence=0.85,
                     ))
                 elif before_event and relation in ("after", "since"):
                     tenses.append(RelativeTense(
-                        before_event=before_event,
-                        after_event=cls._find_event_main_verb(doc),
-                        relation=relation,
-                        confidence=0.80,
+                        before_event=before_event, after_event=cls._find_event_main_verb(doc),
+                        relation=relation, confidence=0.80,
                     ))
                 elif after_event and relation in ("before", "until"):
                     tenses.append(RelativeTense(
-                        before_event=cls._find_event_main_verb(doc),
-                        after_event=after_event,
-                        relation=relation,
-                        confidence=0.80,
+                        before_event=cls._find_event_main_verb(doc), after_event=after_event,
+                        relation=relation, confidence=0.80,
                     ))
-        
         return tenses
     
     @classmethod
@@ -1416,6 +1418,186 @@ class RelativeTenseExtractor:
 
 
 # ============================================================
+# NOUVEAUX EXTRACTEURS
+# ============================================================
+
+class ReportedSpeechExtractor:
+    """Extrait le discours rapporté (il a dit que...)."""
+    
+    REPORTING_VERBS = {
+        "dire": "said", "raconter": "told", "expliquer": "explained",
+        "penser": "thought", "croire": "believed", "savoir": "knew",
+        "espérer": "hoped", "souhaiter": "wished", "craindre": "feared",
+        "affirmer": "affirmed", "prétendre": "claimed", "annoncer": "announced",
+    }
+    
+    @classmethod
+    def extract(cls, doc) -> List[ReportedSpeech]:
+        results = []
+        for token in doc:
+            if token.lemma_ in cls.REPORTING_VERBS and token.dep_ == "ROOT":
+                speaker = cls._find_subject(doc, token)
+                for child in token.children:
+                    if child.text.lower() == "que" and child.dep_ == "mark":
+                        reported = cls._extract_complement_clause(child)
+                        if speaker and reported:
+                            reported_intent = cls._guess_intent(reported)
+                            results.append(ReportedSpeech(
+                                speaker=speaker, verb=token.lemma_, content=reported,
+                                content_intent=reported_intent,
+                                relation=cls.REPORTING_VERBS[token.lemma_],
+                                source_text=f"{speaker} {token.text} que {reported}"
+                            ))
+        return results
+    
+    @classmethod
+    def _find_subject(cls, doc, token) -> Optional[str]:
+        for child in token.children:
+            if child.dep_ in ("nsubj", "nsubj:pass"):
+                return child.text
+        return None
+    
+    @classmethod
+    def _extract_complement_clause(cls, que_token) -> str:
+        words = []
+        for token in que_token.doc[que_token.i + 1:]:
+            if token.dep_ == "ROOT" or token.dep_ == "conj":
+                words.append(token.text)
+                if token.text in (".", "!", "?", ";", ","):
+                    break
+            else:
+                words.append(token.text)
+        return " ".join(words[:20])
+    
+    @classmethod
+    def _guess_intent(cls, text: str) -> Optional[IntentType]:
+        text_lower = text.lower()
+        if any(w in text_lower for w in ["allume", "éteins", "ouvre"]):
+            return "action_device"
+        if "?" in text_lower:
+            return "query_state"
+        if any(w in text_lower for w in ["bonjour", "merci", "salut"]):
+            return "chit_chat"
+        return "information_input"
+
+
+class ContextualRoleExtractor:
+    """Extrait les rôles contextuels (en tant que président)."""
+    
+    ROLE_TRIGGERS = {"en tant que", "comme", "en qualité de"}
+    
+    @classmethod
+    def extract(cls, doc) -> List[ContextualRole]:
+        results = []
+        text_lower = doc.text.lower()
+        
+        for trigger in cls.ROLE_TRIGGERS:
+            if trigger in text_lower:
+                match = re.search(r"(\w+)\s+" + trigger.replace(" ", r"\s+") + r"\s+([\w\s]+?)(?:[.,]|$)", text_lower)
+                if match:
+                    results.append(ContextualRole(
+                        entity=match.group(1).strip(),
+                        role=match.group(2).strip(),
+                        context_phrase=trigger,
+                        source_text=match.group(0)
+                    ))
+        return results
+
+
+class CollectiveEntityExtractor:
+    """Extrait les entités collectives (équipe, groupe)."""
+    
+    COLLECTIVE_NOUNS = {
+        "équipe": "team", "groupe": "group", "famille": "family",
+        "association": "association", "club": "club", "comité": "committee",
+        "équipage": "crew", "public": "audience", "foule": "crowd"
+    }
+    
+    @classmethod
+    def extract(cls, doc) -> List[CollectiveEntity]:
+        results = []
+        for token in doc:
+            if token.lemma_ in cls.COLLECTIVE_NOUNS and token.pos_ == "NOUN":
+                collective_type = cls.COLLECTIVE_NOUNS[token.lemma_]
+                members = cls._extract_members(token)
+                results.append(CollectiveEntity(
+                    name=token.text, members=members,
+                    collective_type=collective_type, source_text=token.text
+                ))
+        return results
+    
+    @classmethod
+    def _extract_members(cls, noun_token) -> List[str]:
+        members = []
+        for child in noun_token.children:
+            if child.dep_ == "nmod":
+                members.append(child.text)
+        return members
+
+
+class EnhancedComparisonExtractor:
+    """Extrait les comparaisons complexes (superlatifs, quantités)."""
+    
+    @classmethod
+    def extract(cls, doc) -> List[Comparison]:
+        comparisons = []
+        
+        for token in doc:
+            if token.text.lower() == "plus" and token.dep_ == "advmod":
+                for child in token.children:
+                    if child.dep_ == "amod":
+                        attribute = child.text
+                        subject = cls._find_subject_of_adj(child)
+                        if subject and attribute:
+                            comparisons.append(Comparison(
+                                subject=subject, comparator="plus", attribute=attribute,
+                                object="groupe_implicite", degree="superlative", confidence=0.85
+                            ))
+        
+        for token in doc:
+            if token.text.lower() == "moins" and token.dep_ == "advmod":
+                for child in token.children:
+                    if child.dep_ == "obj":
+                        comparisons.append(Comparison(
+                            subject=child.text, comparator="moins", attribute="quantité",
+                            object="implicite", degree="inferiority", confidence=0.80
+                        ))
+        
+        return comparisons
+    
+    @classmethod
+    def _find_subject_of_adj(cls, adj_token) -> Optional[str]:
+        for child in adj_token.children:
+            if child.dep_ == "nsubj":
+                return child.text
+        return None
+
+
+class CompoundModalityExtractor:
+    """Extrait les modalités composées (aurait dû)."""
+    
+    @classmethod
+    def extract(cls, doc, verb: VerbAnalysis) -> List[CompoundModality]:
+        results = []
+        if not verb:
+            return results
+        
+        if verb.mood == "conditional" and verb.tense == "past":
+            if verb.modal == "obligation":
+                results.append(CompoundModality(
+                    statement=doc.text, base_modality="obligation",
+                    tense="past", strength=0.9, source_text=doc.text
+                ))
+            elif verb.modal == "possibility":
+                results.append(CompoundModality(
+                    statement=doc.text, base_modality="possibility",
+                    tense="past", strength=0.8, source_text=doc.text
+                ))
+        
+        return results
+
+
+# ============================================================
 # FONCTIONS EXISTANTES (simplifiées)
 # ============================================================
 
@@ -1441,8 +1623,6 @@ COMMON_WORDS_FR = {
 
 
 class FrenchTextCorrector:
-    """Normalise le texte avant analyse NLU."""
-    
     COMMON_MISTAKES: Dict[str, str] = {
         "sava": "ça va", "cetais": "c'était", "cété": "c'était",
         "jsp": "je sais pas", "pk": "pourquoi", "pcq": "parce que",
@@ -1513,8 +1693,6 @@ class FrenchTextCorrector:
 
 
 class FrenchVerbAnalyzer:
-    """Enrichit l'analyse verbale spaCy."""
-    
     IRREGULAR: Dict[str, Tuple[str, str, str]] = {
         "aller": ("vais/vas/va/allons/allez/vont", "allai", "allé"),
         "avoir": ("ai/as/a/avons/avez/ont", "eus", "eu"),
@@ -1573,8 +1751,6 @@ class FrenchVerbAnalyzer:
 
 
 class FrenchTemporalResolver:
-    """Résout les expressions temporelles françaises."""
-    
     MOMENTS = {
         "midi": (12, 12, "point"), "minuit": (0, 0, "point"),
         "matin": (6, 12, "interval"), "matinée": (6, 12, "interval"),
@@ -1823,14 +1999,10 @@ class FrenchTemporalResolver:
         if not d or not d.get("iso_start") and d.get("timex_type") != "DURATION":
             return None
         return TemporalSpan(
-            raw=d.get("raw", ""),
-            iso_start=d.get("iso_start", ""),
-            iso_end=d.get("iso_end", ""),
-            timex_type=d.get("timex_type", "DATE"),
-            source=d.get("source", ""),
+            raw=d.get("raw", ""), iso_start=d.get("iso_start", ""), iso_end=d.get("iso_end", ""),
+            timex_type=d.get("timex_type", "DATE"), source=d.get("source", ""),
             duration_raw=d.get("raw") if d.get("timex_type") == "DURATION" else None,
-            duration_unit=d.get("duration_unit"),
-            duration_value=d.get("duration_value"),
+            duration_unit=d.get("duration_unit"), duration_value=d.get("duration_value"),
             named_event=d.get("named_event"),
         )
     
@@ -1855,7 +2027,6 @@ def _get_temporal_resolver() -> FrenchTemporalResolver:
 
 @dataclass
 class ConversationContext:
-    """Résolution des ellipses et pronoms anaphoriques."""
     last_intent_type: Optional[IntentType] = None
     last_verb_lemma: Optional[str] = None
     last_actor: Optional[str] = None
@@ -1901,7 +2072,6 @@ class ConversationContext:
 
 @dataclass
 class ConversationFrame:
-    """Héritage de slots (who/when/where) entre fragments."""
     who: Optional[PersonType] = None
     who_raw: Optional[str] = None
     with_who: List[str] = field(default_factory=list)
@@ -2725,7 +2895,7 @@ class IntentPipeline:
         temporal = _extract_temporal_v4(doc, tense, self._resolver)
         what = _extract_what(doc)
         
-        # Nouveaux extracteurs
+        # Extracteurs existants
         relations = RelationExtractor.extract(doc)
         triplets = [(r.subject, r.predicate, r.object) for r in relations if r.subject and r.object]
         coreferences = CoreferenceExtractor.extract(doc)
@@ -2734,12 +2904,17 @@ class IntentPipeline:
         subordinate_clauses = SubordinateClauseExtractor.extract(doc)
         relative_tenses = RelativeTenseExtractor.extract(doc)
         
-        # Extraction du temps programmé pour les actions
+        # Nouveaux extracteurs
+        reported_speeches = ReportedSpeechExtractor.extract(doc)
+        contextual_roles = ContextualRoleExtractor.extract(doc)
+        collective_entities = CollectiveEntityExtractor.extract(doc)
+        enhanced_comparisons = EnhancedComparisonExtractor.extract(doc)
+        compound_modalities = CompoundModalityExtractor.extract(doc, verb) if verb else []
+        
         scheduled_time = None
         if verb and verb.mood == "imperative":
             scheduled_time = ScheduledTimeExtractor.extract(text)
         
-        # Quantifieurs
         quantifiers = []
         for token in doc:
             if token.text.lower() in ("tous", "toutes", "chaque", "aucun", "aucune", "quelques"):
@@ -2751,7 +2926,6 @@ class IntentPipeline:
                             quantifier_type=qtype, confidence=0.85,
                         ))
         
-        # Négations
         negations = []
         for token in doc:
             if token.lemma_ in ("ne", "pas", "plus", "jamais") and token.dep_ == "advmod":
@@ -2762,7 +2936,6 @@ class IntentPipeline:
                             scope=token.head.text, confidence=0.9,
                         ))
         
-        # Comparaisons
         comparisons = []
         for token in doc:
             if token.text.lower() in ("plus", "moins", "aussi"):
@@ -2786,8 +2959,8 @@ class IntentPipeline:
                         subject=subject, comparator=token.text.lower(),
                         attribute=attribute, object=object_, degree=degree, confidence=0.85,
                     ))
+        comparisons.extend(enhanced_comparisons)
         
-        # Rôles
         roles = []
         for token in doc:
             if token.lemma_ in ("être", "devenir") and token.dep_ == "ROOT":
@@ -2809,12 +2982,10 @@ class IntentPipeline:
                 if subject and role:
                     roles.append(Role(entity=subject, role=role, context=context, confidence=0.85))
         
-        # Intentions secondaires
         primary_intent = classify_intent(verb, doc, text)["intent"]
         secondary_intents = SecondaryIntentExtractor.extract(doc, primary_intent, 
                                                              scheduled_time.to_dict() if scheduled_time else None)
         
-        # Ensemble des entités
         entities_set = set()
         for ent in doc.ents:
             if ent.label_ == "PER":
@@ -2823,14 +2994,12 @@ class IntentPipeline:
             if token.pos_ == "NOUN" and token.dep_ == "nsubj":
                 entities_set.add(token.text)
         
-        # Durées et temps
         durations = _parse_durations(text) or self._frame.durations
         if temporal and durations:
             temporal = _merge_time_duration(temporal, durations)
         elif not temporal and self._frame.when and durations:
             temporal = _merge_time_duration(self._frame.when, durations)
         
-        # Si on a un temps programmé, l'ajouter au TemporalSpan
         if scheduled_time and temporal:
             temporal.scheduled = scheduled_time
         
@@ -2882,6 +3051,7 @@ class IntentPipeline:
             print(f"    coreferences: {len(coreferences)}")
             print(f"    attributes: {len(attributes)}")
             print(f"    events: {len(events)}")
+            print(f"    reported_speeches: {len(reported_speeches)}")
             if scheduled_time:
                 print(f"    scheduled: {scheduled_time.human}")
         
@@ -2910,6 +3080,10 @@ class IntentPipeline:
             temporal_sequences=[], subordinate_clauses=subordinate_clauses,
             secondary_intents=secondary_intents, relative_tenses=relative_tenses,
             scheduled_time=scheduled_time,
+            reported_speeches=reported_speeches,
+            contextual_roles=contextual_roles,
+            collective_entities=collective_entities,
+            compound_modalities=compound_modalities,
             entities_set=entities_set, facts=set(),
         )
     
@@ -2923,7 +3097,8 @@ class IntentPipeline:
     def benchmark(self, n: int = 20) -> dict:
         samples = ["comment tu vas ?", "t'étais où hier soir ?",
                    "allume la lumière", "je jardinerai demain matin pendant 2h",
-                   "rappelle-moi d'éteindre la lumière dans 20 minutes"]
+                   "rappelle-moi d'éteindre la lumière dans 20 minutes",
+                   "Paul a dit qu'il viendrait"]
         times = []
         for i in range(n):
             t0 = time.time()
@@ -3087,6 +3262,22 @@ def run_tests():
         doc = nlp("le fils de Marie")
         relations = RelationExtractor.extract(doc)
         check("relation 'fils de Marie'", len(relations) > 0)
+        
+        print("\n  [ReportedSpeechExtractor]")
+        doc = nlp("Paul a dit qu'il viendrait")
+        speeches = ReportedSpeechExtractor.extract(doc)
+        check("reported speech", len(speeches) > 0)
+        
+        print("\n  [ContextualRoleExtractor]")
+        doc = nlp("En tant que président, je déclare")
+        roles = ContextualRoleExtractor.extract(doc)
+        check("contextual role", len(roles) > 0)
+        
+        print("\n  [CollectiveEntityExtractor]")
+        doc = nlp("L'équipe de France")
+        collectives = CollectiveEntityExtractor.extract(doc)
+        check("collective entity", len(collectives) > 0)
+        
     except Exception as e:
         print(f"  ⚠️ spaCy non disponible: {e}")
     
@@ -3147,6 +3338,8 @@ if __name__ == "__main__":
                         if intent.get('scheduled_time'):
                             st = intent['scheduled_time']
                             print(f"  Programmé: {st.get('human', st.get('raw'))}")
+                        if intent.get('reported_speeches'):
+                            print(f"  Discours rapporté: {len(intent['reported_speeches'])}")
                         if intent.get('relations'):
                             print(f"  Relations: {len(intent['relations'])}")
                         if intent.get('events'):
