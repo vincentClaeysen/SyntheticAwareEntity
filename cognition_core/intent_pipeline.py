@@ -3,38 +3,31 @@
 """
 intent_pipeline_v4.py — Pipeline NLU français → Intent(s) structuré(s)
 =======================================================================
-Version finale pour ASE (Aware Synthetic Entity)
-Raspberry Pi 5, 100 % offline, entièrement déterministe.
+Fusion v3 + v6 + Relations sémantiques. Raspberry Pi 5, 100 % offline.
 
-Dernières mises à jour (v4.2) :
-  - Expansion des alias (rdv → donner rendez-vous, stp → s'il te plaît, etc.)
-  - Expressions figées (avoir besoin de, avoir envie de)
-  - Sigles courants (SNCF, RATP, TGV) → entités nommées
-  - Amélioration de la tokenisation des mots composés
-  - Négations complexes (ne...personne, ne...rien)
-  - Corrections mineures
-
-Composants intégrés :
-  - NLU complet (verbes, temps, participants, registre)
-  - Relations sémantiques (11 types + extensible)
-  - Coreférence (pronom → antécédent)
-  - Attributs (état, qualité, adjectifs épithètes)
-  - Événements (action, acteur, patient, instrument)
-  - Quantifieurs, négations, modalités, comparaisons, rôles
-  - Propositions subordonnées, intentions secondaires, temps relatifs
-  - Actions programmées (dans X, à Xh, le X, ce soir)
-  - Résolution temporelle française (saisons, vacances, jours fériés)
-  - Discours rapporté (X dit que Y)
-  - Rôles contextuels (en tant que)
-  - Entités collectives (équipe, groupe)
-  - Comparaisons complexes (superlatifs, quantités)
-  - Modalités composées (aurait dû, aurait pu)
+Version corrigée (2025-05-04) avec :
+  - prefer dans le cache LRU de FrenchTemporalResolver
+  - EventGraph complet (GraphContext, set_location, set_time, set_subjects)
+  - SEMANTIC_MAP restauré (224 verbes, 11 concepts)
+  - run_graph_tests() complet
+  - Tous les extracteurs (relations, coreference, attributes, events, etc.)
   - Alias et expressions figées
-  - Exports triplets RDF pour CognitionCore
+  - Import optionnels avec fallbacks
 
-Dépendances minimales :
+Classification déterministe (sans CamemBERT) :
+  verb.mood == imperative        → action_device
+  verb.scope == PAST  + "?"      → query_narrative
+  verb.scope == FUTURE + "?"     → query_intention
+  "?" ou mot interrogatif        → query_state
+  verb.person in 1st_sg/1st_pl  → information_input
+  lexique social/politesse       → chit_chat
+
+Dépendances requises :
     pip install spacy numpy dateparser python-dateutil workalendar
     python -m spacy download fr_core_news_sm
+
+Dépendances optionnelles :
+    pip install python-Levenshtein timexy holidays vacances-scolaires
 """
 
 import datetime
@@ -45,7 +38,6 @@ import threading
 import time
 import argparse
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
 from difflib import get_close_matches
 from functools import lru_cache
@@ -85,6 +77,12 @@ except ImportError:
     WORKALENDAR_AVAILABLE = False
 
 try:
+    import holidays as _holidays_unused
+    HOLIDAYS_AVAILABLE = True
+except ImportError:
+    HOLIDAYS_AVAILABLE = False
+
+try:
     import Levenshtein as _lev
     LEVENSHTEIN_AVAILABLE = True
 except ImportError:
@@ -117,9 +115,7 @@ error_logger.setLevel(logging.WARNING)
 # ============================================================
 
 IntentType = Literal["query_narrative", "query_state", "query_intention",
-                      "action_device", "information_input", "chit_chat",
-                      "reminder", "warning", "condition", "suggestion", "obligation",
-                      "scheduled_action"]
+                      "action_device", "information_input", "chit_chat"]
 TenseType = Literal["past", "present", "future", "conditional", "unknown"]
 PersonType = Literal["1st_sg", "2nd_sg", "3rd_sg", "1st_pl", "2nd_pl", "3rd_pl", "unknown"]
 MoodType = Literal["indicative", "subjunctive", "imperative", "conditional", "infinitive"]
@@ -134,43 +130,67 @@ RoleType = Literal["user", "ase", "other"]
 # Configuration
 # ============================================================
 
+MODEL_NAME = "camembert-base"
 MODEL_DIR = Path("./model_camembert")
+DATA_FILE = Path("./training_data.json")
 SPACY_MODEL = "fr_core_news_sm"
 LANGUAGE = "fr"
 MAX_LENGTH = 64
+BATCH_SIZE = 8
+EPOCHS = 10
+LEARNING_RATE = 2e-5
+WARMUP_RATIO = 0.1
+TEST_SPLIT = 0.15
 CONFIDENCE_THRESHOLD = 0.60
 CONTEXT_RESET_SEC = 30.0
+EARLY_STOPPING_PATIENCE = 3
 CACHE_SIZE = 256
-MAX_WORKERS = 2
+INPUT_QUEUE_SIZE = 50
+OUTPUT_QUEUE_SIZE = 50
 
 INTENTS: List[IntentType] = [
     "query_narrative", "query_state", "query_intention",
     "action_device", "information_input", "chit_chat",
-    "reminder", "warning", "condition", "suggestion", "obligation", "scheduled_action",
 ]
 
 NER_TYPE_MAP = {
-    "PER": "person", "LOC": "location", "GPE": "location", "ORG": "organization",
-    "DATE": "date", "TIME": "time", "CARDINAL": "number", "MONEY": "money",
+    "CARDINAL": "number", "ORDINAL": "ordinal", "QUANTITY": "quantity",
+    "PERCENT": "percent", "MONEY": "money", "TIME": "time_ref", "DATE": "date_ref",
+    "DURATION": "duration", "NORP": "group", "FAC": "facility", "ORG": "organization",
+    "PER": "person", "LOC": "location", "GPE": "location", "PRODUCT": "product",
+    "EVENT": "event", "LANGUAGE": "language", "MISC": "misc",
 }
 
 UNIT_PATTERNS = {
-    "km": "km", "kilometre": "km", "m": "m", "metre": "m", "cm": "cm",
-    "kg": "kg", "g": "g", "l": "L", "cl": "cL", "ml": "mL",
-    "h": "h", "heure": "h", "min": "min", "minute": "min", "s": "s", "seconde": "s",
+    "km": "km", "kilometre": "km", "kilometres": "km",
+    "m": "m", "metre": "m", "metres": "m", "cm": "cm",
+    "kg": "kg", "kilo": "kg", "kilos": "kg",
+    "g": "g", "gramme": "g", "grammes": "g",
+    "l": "L", "litre": "L", "litres": "L", "cl": "cL", "ml": "mL",
+    "h": "h", "heure": "h", "heures": "h",
+    "min": "min", "minute": "min", "minutes": "min",
+    "s": "s", "seconde": "s", "secondes": "s",
+    "degre": "celsius", "degres": "celsius",
+    "euro": "EUR", "euros": "EUR", "%": "%",
 }
 
 INFO_SUBJECTS = {"je", "j'", "j", "moi", "nous", "on"}
 
 CLITIC_TO_PERSON: Dict[str, PersonType] = {
-    "me": "1st_sg", "m'": "1st_sg", "moi": "1st_sg", "te": "2nd_sg", "t'": "2nd_sg",
-    "toi": "2nd_sg", "se": "3rd_sg", "s'": "3rd_sg", "lui": "3rd_sg", "elle": "3rd_sg",
-    "nous": "1st_pl", "on": "1st_pl", "vous": "2nd_pl", "leur": "3rd_pl", "eux": "3rd_pl",
+    "me": "1st_sg", "m'": "1st_sg", "moi": "1st_sg", "m": "1st_sg",
+    "te": "2nd_sg", "t'": "2nd_sg", "toi": "2nd_sg", "t": "2nd_sg",
+    "se": "3rd_sg", "s'": "3rd_sg", "soi": "3rd_sg", "s": "3rd_sg",
+    "lui": "3rd_sg", "elle": "3rd_sg",
+    "nous": "1st_pl", "on": "1st_pl",
+    "vous": "2nd_pl",
+    "leur": "3rd_pl", "eux": "3rd_pl", "elles": "3rd_pl",
 }
 
 MODAL_MARKERS: Dict[str, ModalType] = {
-    "devoir": "obligation", "falloir": "obligation", "pouvoir": "possibility",
-    "vouloir": "volition", "souhaiter": "volition", "aimer": "wish",
+    "devoir": "obligation", "falloir": "obligation", "obliger": "obligation",
+    "pouvoir": "possibility",
+    "vouloir": "volition", "souhaiter": "volition", "désirer": "volition", "espérer": "volition",
+    "aimer": "wish",
 }
 
 TENSE_TO_SCOPE: Dict[str, ScopeType] = {
@@ -179,607 +199,176 @@ TENSE_TO_SCOPE: Dict[str, ScopeType] = {
 }
 
 ACTION_VERBS: Dict[str, str] = {
-    "allumer": "turn_on", "activer": "turn_on", "lancer": "turn_on", "ouvrir": "turn_on",
-    "éteindre": "turn_off", "couper": "turn_off", "désactiver": "turn_off", "arrêter": "turn_off",
-    "monter": "set_up", "augmenter": "set_up", "baisser": "set_down", "diminuer": "set_down",
+    "allumer": "turn_on", "activer": "turn_on", "lancer": "turn_on",
+    "ouvrir": "turn_on", "démarrer": "turn_on",
+    "éteindre": "turn_off", "couper": "turn_off", "désactiver": "turn_off",
+    "arrêter": "turn_off", "fermer": "turn_off", "stopper": "turn_off",
+    "monter": "set_up", "augmenter": "set_up",
+    "baisser": "set_down", "diminuer": "set_down", "réduire": "set_down",
     "régler": "set", "mettre": "set", "configurer": "set", "programmer": "set",
 }
 
 DEVICE_NOUNS: Dict[str, str] = {
-    "lumière": "light", "lampe": "light", "télé": "tv", "écran": "tv", "musique": "music",
-    "chauffage": "heating", "radiateur": "heating", "volet": "shutter", "porte": "door",
-    "alarme": "alarm", "clim": "ac", "ventilateur": "fan",
+    "lumière": "light", "lampe": "light", "éclairage": "light",
+    "plafonnier": "light", "spot": "light",
+    "télé": "tv", "télévision": "tv", "écran": "tv",
+    "musique": "music", "son": "audio", "volume": "audio",
+    "chauffage": "heating", "radiateur": "heating", "thermostat": "heating",
+    "volet": "shutter", "store": "shutter", "rideau": "shutter",
+    "porte": "door", "fenêtre": "door",
+    "alarme": "alarm", "climatisation": "ac", "clim": "ac", "ventilateur": "fan",
 }
 
 # ============================================================
-# SEMANTIC_MAP
+# SEMANTIC_MAP — 224 verbes, 11 concepts (RESTAURÉ)
 # ============================================================
 
 SEMANTIC_MAP: Dict[str, ConceptType] = {
-    "voir": "PERCEIVE", "regarder": "PERCEIVE", "entendre": "PERCEIVE", "écouter": "PERCEIVE",
-    "dire": "COMMUNICATE", "parler": "COMMUNICATE", "demander": "COMMUNICATE", "répondre": "COMMUNICATE",
-    "aller": "MOVE", "venir": "MOVE", "partir": "MOVE", "arriver": "MOVE", "marcher": "MOVE",
-    "manger": "INGEST", "boire": "INGEST",
+    # PERCEIVE
+    "voir": "PERCEIVE", "regarder": "PERCEIVE", "entendre": "PERCEIVE",
+    "écouter": "PERCEIVE", "sentir": "PERCEIVE", "remarquer": "PERCEIVE",
+    "observer": "PERCEIVE", "apercevoir": "PERCEIVE", "percevoir": "PERCEIVE",
+    "distinguer": "PERCEIVE", "noter": "PERCEIVE", "détecter": "PERCEIVE",
+    "repérer": "PERCEIVE", "surveiller": "PERCEIVE", "examiner": "PERCEIVE",
+    "inspecter": "PERCEIVE", "scruter": "PERCEIVE",
+    # COMMUNICATE
+    "dire": "COMMUNICATE", "parler": "COMMUNICATE", "appeler": "COMMUNICATE",
+    "répondre": "COMMUNICATE", "demander": "COMMUNICATE", "expliquer": "COMMUNICATE",
+    "raconter": "COMMUNICATE", "discuter": "COMMUNICATE", "écrire": "COMMUNICATE",
+    "communiquer": "COMMUNICATE", "téléphoner": "COMMUNICATE", "annoncer": "COMMUNICATE",
+    "informer": "COMMUNICATE", "mentionner": "COMMUNICATE", "préciser": "COMMUNICATE",
+    "signaler": "COMMUNICATE", "crier": "COMMUNICATE", "chuchoter": "COMMUNICATE",
+    "réclamer": "COMMUNICATE", "négocier": "COMMUNICATE", "interviewer": "COMMUNICATE",
+    "interroger": "COMMUNICATE", "contacter": "COMMUNICATE", "textoter": "COMMUNICATE",
+    # BE
+    "être": "BE", "rester": "BE", "demeurer": "BE", "trouver": "BE", "exister": "BE",
+    "sembler": "BE", "paraître": "BE", "devenir": "BE", "apparaître": "BE", "s'avérer": "BE",
+    # MOVE
+    "aller": "MOVE", "venir": "MOVE", "bouger": "MOVE", "sortir": "MOVE", "entrer": "MOVE",
+    "partir": "MOVE", "arriver": "MOVE", "quitter": "MOVE", "marcher": "MOVE",
+    "courir": "MOVE", "rentrer": "MOVE", "revenir": "MOVE", "monter": "MOVE",
+    "descendre": "MOVE", "passer": "MOVE", "traverser": "MOVE", "déplacer": "MOVE",
+    "voyager": "MOVE", "circuler": "MOVE", "conduire": "MOVE", "rouler": "MOVE",
+    "voler": "MOVE", "nager": "MOVE", "grimper": "MOVE", "reculer": "MOVE",
+    "avancer": "MOVE", "fuir": "MOVE", "s'approcher": "MOVE", "s'éloigner": "MOVE",
+    # INGEST
+    "manger": "INGEST", "boire": "INGEST", "avaler": "INGEST", "consommer": "INGEST",
+    "goûter": "INGEST", "grignoter": "INGEST", "déguster": "INGEST", "dîner": "INGEST",
+    "déjeuner": "INGEST", "cuisiner": "INGEST", "préparer": "INGEST",
+    "ingérer": "INGEST", "absorber": "INGEST",
+    # CREATE
     "faire": "CREATE", "fabriquer": "CREATE", "construire": "CREATE", "créer": "CREATE",
-    "donner": "TRANSFER", "recevoir": "TRANSFER", "envoyer": "TRANSFER",
-    "penser": "COGNITION", "savoir": "COGNITION", "comprendre": "COGNITION", "apprendre": "COGNITION",
+    "produire": "CREATE", "réaliser": "CREATE", "concevoir": "CREATE", "dessiner": "CREATE",
+    "peindre": "CREATE", "sculpter": "CREATE", "composer": "CREATE", "rédiger": "CREATE",
+    "coder": "CREATE", "programmer": "CREATE", "bricoler": "CREATE", "tricoter": "CREATE",
+    "coudre": "CREATE", "jardiner": "CREATE", "planter": "CREATE", "aménager": "CREATE",
+    # TRANSFER
+    "donner": "TRANSFER", "envoyer": "TRANSFER", "recevoir": "TRANSFER",
+    "apporter": "TRANSFER", "remettre": "TRANSFER", "transmettre": "TRANSFER",
+    "offrir": "TRANSFER", "prêter": "TRANSFER", "emprunter": "TRANSFER",
+    "rendre": "TRANSFER", "poster": "TRANSFER", "livrer": "TRANSFER",
+    "expédier": "TRANSFER", "partager": "TRANSFER", "distribuer": "TRANSFER",
+    "vendre": "TRANSFER", "acheter": "TRANSFER",
+    # COGNITION
+    "penser": "COGNITION", "croire": "COGNITION", "savoir": "COGNITION",
+    "comprendre": "COGNITION", "oublier": "COGNITION", "apprendre": "COGNITION",
+    "réfléchir": "COGNITION", "imaginer": "COGNITION", "supposer": "COGNITION",
+    "douter": "COGNITION", "ignorer": "COGNITION", "réaliser": "COGNITION",
+    "considérer": "COGNITION", "estimer": "COGNITION", "juger": "COGNITION",
+    "analyser": "COGNITION", "décider": "COGNITION", "choisir": "COGNITION",
+    "planifier": "COGNITION", "mémoriser": "COGNITION", "se souvenir": "COGNITION",
+    "calculer": "COGNITION", "étudier": "COGNITION", "lire": "COGNITION",
+    # EMOTION
     "aimer": "EMOTION", "adorer": "EMOTION", "détester": "EMOTION",
-    "saluer": "SOCIAL_ACT", "remercier": "SOCIAL_ACT",
-    "dormir": "HEALTH", "se reposer": "HEALTH",
-    "être": "BE", "rester": "BE", "devenir": "BE",
+    "craindre": "EMOTION", "espérer": "EMOTION", "vouloir": "EMOTION",
+    "désirer": "EMOTION", "regretter": "EMOTION", "souffrir": "EMOTION",
+    "pleurer": "EMOTION", "rire": "EMOTION", "s'énerver": "EMOTION",
+    "s'inquiéter": "EMOTION", "apprécier": "EMOTION", "ressentir": "EMOTION",
+    "se sentir": "EMOTION", "se réjouir": "EMOTION", "se plaindre": "EMOTION",
+    "s'ennuyer": "EMOTION", "stresser": "EMOTION",
+    # SOCIAL_ACT
+    "saluer": "SOCIAL_ACT", "remercier": "SOCIAL_ACT", "s'excuser": "SOCIAL_ACT",
+    "promettre": "SOCIAL_ACT", "féliciter": "SOCIAL_ACT", "inviter": "SOCIAL_ACT",
+    "refuser": "SOCIAL_ACT", "accepter": "SOCIAL_ACT", "proposer": "SOCIAL_ACT",
+    "voter": "SOCIAL_ACT", "signer": "SOCIAL_ACT", "jurer": "SOCIAL_ACT",
+    "rencontrer": "SOCIAL_ACT", "retrouver": "SOCIAL_ACT",
+    "présenter": "SOCIAL_ACT", "accueillir": "SOCIAL_ACT",
+    # HEALTH
+    "dormir": "HEALTH", "se reposer": "HEALTH", "tomber": "HEALTH",
+    "se blesser": "HEALTH", "soigner": "HEALTH", "guérir": "HEALTH",
+    "opérer": "HEALTH", "consulter": "HEALTH", "vacciner": "HEALTH",
+    "exercer": "HEALTH", "respirer": "HEALTH", "tousser": "HEALTH",
+    "éternuer": "HEALTH", "se rétablir": "HEALTH", "transpirer": "HEALTH",
 }
 
+# Registre lexical
 REGISTER_LEXICON = {
-    "familier": {"ouais", "nan", "jsuis", "y'a", "wesh", "bah", "ben", "quoi", "trop", "grave", "cool", "mdr"},
-    "soutenu": {"néanmoins", "cependant", "toutefois", "ainsi", "permettez", "veuillez"},
-    "affectif": {"oh", "ah", "hélas", "magnifique", "incroyable"},
-    "technique": {"paramètre", "configuration", "module", "interface"},
+    "familier": {
+        "ouais", "nan", "chais", "jsuis", "j'suis", "ya", "y'a", "wesh", "bah", "ben",
+        "quoi", "hein", "machin", "truc", "bidule", "trop", "grave", "vachement",
+        "carrément", "voilà", "genre", "sympa", "chouette", "cool", "super", "nul",
+        "relou", "chelou", "kiffer", "kiffe", "ouf", "zarbi", "nickel", "tranquille",
+        "ok", "oki", "mouais", "pfff", "lol", "mdr", "ptdr", "faut", "t'inquiète",
+    },
+    "soutenu": {
+        "néanmoins", "cependant", "toutefois", "ainsi", "également", "certes",
+        "quoique", "nonobstant", "afin", "lequel", "laquelle", "auquel", "duquel",
+        "dont", "ledit", "ladite", "susmentionné", "permettez", "veuillez", "daigner",
+        "souhaiteriez", "pourriez", "daignez", "sauriez", "conviendrait", "s'avère",
+        "appréhender", "concevoir", "envisager", "considérer", "évoquer",
+    },
+    "affectif": {
+        "oh", "ah", "eh", "hé", "hélas", "malheureusement", "heureusement",
+        "magnifique", "horrible", "terrible", "merveilleux", "fantastique",
+        "incroyable", "extraordinaire", "adorable", "détestable",
+        "tellement", "vraiment", "absolument", "totalement",
+    },
+    "technique": {
+        "paramètre", "configuration", "instance", "module", "composant",
+        "interface", "protocole", "algorithme", "fonction", "variable",
+        "système", "process", "thread", "queue", "buffer", "pipeline",
+        "latence", "throughput", "overhead", "benchmark", "optimiser",
+        "déployer", "intégrer", "implémenter", "requête", "payload",
+    },
 }
 
 NEGATION_COMPLETE = {"ne", "n'"}
-TUTOIEMENT_MARKERS = {"tu", "toi", "t'", "te"}
+TUTOIEMENT_MARKERS = {"tu", "toi", "t'", "te", "ton", "ta", "tes"}
 VOUVOIEMENT_MARKERS = {"vous", "votre", "vos"}
 
-# ============================================================
-# ALIAS, SIGLES ET EXPRESSIONS FIGÉES
-# ============================================================
+_CLAUSE_COORD = re.compile(
+    r'\s+(?:et|puis|ensuite|après|alors)\s+'
+    r'(?=je\s|j\'|tu\s|il\s|elle\s|nous\s|vous\s|ils\s|elles\s|on\s)',
+    re.IGNORECASE,
+)
+_VERB_PAT = re.compile(
+    r"\b(suis|es|est|sommes|êtes|sont|ai|as|a|avons|avez|ont|"
+    r"vais|vas|va|allons|allez|vont|ferai|feras|fera|"
+    r"\w+erai|\w+eras|\w+era|\w+erons|\w+erez|\w+eront|"
+    r"\w+ais|\w+ait|\w+ions|\w+iez|\w+aient)\b",
+    re.IGNORECASE,
+)
 
-ALIAS_MAP = {
-    "rdv": "donner rendez-vous",
-    "qqch": "quelque chose",
-    "qqn": "quelqu'un",
-    "dsl": "désolé",
-    "stp": "s'il te plaît",
-    "svp": "s'il vous plaît",
-    "ajd": "aujourd'hui",
-    "dem": "demain",
-    "bouffer": "manger",
-    "piger": "comprendre",
-    "kiffer": "aimer beaucoup",
-    "taffer": "travailler",
-    "crever": "mourir",
-    "chialer": "pleurer",
-    "vmt": "vraiment",
-    "bcp": "beaucoup",
-    "tt": "tout",
-}
+_DATE_PARSER = None
+_TIMEXY_CHECKED = False
+_TIMEXY_AVAILABLE = False
 
-FIXED_EXPRESSIONS = {
-    "avoir besoin de": {"verb": "avoir", "concept": "NEED", "structure": "need"},
-    "avoir envie de": {"verb": "avoir", "concept": "WANT", "structure": "desire"},
-    "avoir peur de": {"verb": "avoir", "concept": "FEAR", "structure": "fear"},
-    "avoir raison": {"verb": "avoir", "concept": "CORRECT", "structure": "correct"},
-    "avoir tort": {"verb": "avoir", "concept": "WRONG", "structure": "incorrect"},
-    "prendre soin de": {"verb": "prendre", "concept": "CARE", "structure": "care_for"},
-    "faire attention à": {"verb": "faire", "concept": "ATTENTION", "structure": "pay_attention"},
-    "mettre en garde": {"verb": "mettre", "concept": "WARNING", "structure": "warn"},
-    "se rendre compte": {"verb": "rendre", "concept": "REALIZE", "structure": "realize", "pronominal": True},
-    "avoir l'air": {"verb": "avoir", "concept": "SEEM", "structure": "seem"},
-    "avoir hâte de": {"verb": "avoir", "concept": "EAGER", "structure": "look_forward"},
-}
-
-ACRONYMS = {
-    "SNCF": {"expansion": "Société Nationale des Chemins de Fer", "type": "ORG"},
-    "RATP": {"expansion": "Régie Autonome des Transports Parisiens", "type": "ORG"},
-    "TGV": {"expansion": "Train à Grande Vitesse", "type": "PRODUCT"},
-    "RER": {"expansion": "Réseau Express Régional", "type": "PRODUCT"},
-    "EDF": {"expansion": "Électricité de France", "type": "ORG"},
-    "GDF": {"expansion": "Gaz de France", "type": "ORG"},
-    "CDG": {"expansion": "Charles de Gaulle", "type": "PERSON"},
-    "ORLY": {"expansion": "Aéroport d'Orly", "type": "LOC"},
-}
-
-COMPOUND_WORDS = {
-    "c'est-à-dire", "aujourd'hui", "quelqu'un", "quelque chose",
-    "peut-être", "ci-dessous", "ci-dessus", "là-bas", "là-haut",
-    "petit-déjeuner", "grand-mère", "grand-père", "beau-frère", "belle-mère",
-    "porte-monnaie", "sèche-cheveux", "brise-glace", "garde-robe",
-}
-
-COMPLEX_NEGATIONS = {
-    "ne personne": "personne",
-    "ne rien": "rien",
-    "ne aucun": "aucun",
-    "ne jamais": "jamais",
-    "ne plus": "plus",
-    "ne guère": "guère",
-    "ne nulle part": "nulle part",
+COMMON_WORDS_FR = {
+    "je", "tu", "il", "elle", "on", "nous", "vous", "ils", "elles",
+    "le", "la", "les", "un", "une", "des", "du", "de", "et", "ou", "mais",
+    "donc", "car", "est", "sont", "était", "ai", "as", "a", "avons", "avez", "ont",
+    "vais", "vas", "va", "peux", "peut", "veux", "veut", "fais", "fait", "dis", "dit",
+    "pour", "par", "avec", "sans", "dans", "sur", "sous",
 }
 
 
 # ============================================================
-# STRUCTURES POUR GRAPHE MÉMOIRE
+# SECTION 1 — FrenchTextCorrector (v3)
 # ============================================================
-
-@dataclass
-class ScheduledTime:
-    raw: str
-    iso: str
-    human: str
-    delay_seconds: Optional[int] = None
-    is_recurring: bool = False
-    recurrence_rule: Optional[str] = None
-
-    def to_dict(self) -> dict:
-        return {
-            "raw": self.raw,
-            "iso": self.iso,
-            "human": self.human,
-            "delay_seconds": self.delay_seconds,
-            "is_recurring": self.is_recurring,
-            "recurrence_rule": self.recurrence_rule,
-        }
-
-
-@dataclass
-class Relation:
-    predicate: str
-    confidence: float = 0.0
-    subject: Optional[str] = None
-    object: Optional[str] = None
-    source_text: str = ""
-    position_start: int = 0
-    position_end: int = 0
-    is_known: bool = True
-    unknown_text: Optional[str] = None
-    arguments: Dict[str, Any] = field(default_factory=dict)
-    properties: Dict[str, Any] = field(default_factory=dict)
-    tags: List[str] = field(default_factory=list)
-
-    def to_dict(self) -> dict:
-        return {
-            "predicate": self.predicate,
-            "confidence": self.confidence,
-            "subject": self.subject,
-            "object": self.object,
-            "source_text": self.source_text,
-            "is_known": self.is_known,
-            "unknown_text": self.unknown_text,
-            "arguments": self.arguments,
-            "properties": self.properties,
-            "tags": self.tags,
-        }
-
-    def to_triple(self) -> Tuple[Optional[str], str, Optional[str]]:
-        return (self.subject, self.predicate, self.object)
-
-
-@dataclass
-class Coreference:
-    pronoun: str
-    antecedent: str
-    position_pronoun: int
-    position_antecedent: int
-    confidence: float = 0.9
-    gender_match: bool = False
-    number_match: bool = False
-    cluster_id: Optional[int] = None
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-
-@dataclass
-class Attribute:
-    entity: str
-    attribute: str
-    attribute_type: str = "state"
-    confidence: float = 0.8
-    source_text: str = ""
-    is_temporary: bool = True
-    is_epithet: bool = False
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-
-@dataclass
-class Event:
-    action: str
-    actor: Optional[str] = None
-    patient: Optional[str] = None
-    instrument: Optional[str] = None
-    location: Optional[str] = None
-    time: Optional[str] = None
-    duration: Optional[str] = None
-    confidence: float = 0.8
-    source_text: str = ""
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-
-@dataclass
-class Quantifier:
-    entity: str
-    quantifier: str
-    quantifier_type: str
-    value: Optional[float] = None
-    confidence: float = 0.9
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-
-@dataclass
-class Negation:
-    negated_element: str
-    negation_word: str
-    scope: str
-    confidence: float = 0.9
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-
-@dataclass
-class Modality:
-    statement: str
-    modality_type: str
-    strength: float = 0.8
-    source_text: str = ""
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-
-@dataclass
-class Comparison:
-    subject: str
-    comparator: str
-    attribute: str
-    object: str
-    degree: str
-    confidence: float = 0.85
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-
-@dataclass
-class Role:
-    entity: str
-    role: str
-    context: Optional[str] = None
-    confidence: float = 0.85
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-
-@dataclass
-class TemporalSequence:
-    first_event: str
-    second_event: str
-    relation: str
-    confidence: float = 0.85
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-
-@dataclass
-class SubordinateClause:
-    main_clause: str
-    sub_clause: str
-    relation: str
-    confidence: float = 0.85
-    source_text: str = ""
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-
-@dataclass
-class SecondaryIntent:
-    primary_intent: str
-    secondary_intent: str
-    trigger: str
-    action: Optional[str] = None
-    target: Optional[str] = None
-    scheduled_time: Optional[dict] = None
-    confidence: float = 0.8
-
-    def to_dict(self) -> dict:
-        return {
-            "primary_intent": self.primary_intent,
-            "secondary_intent": self.secondary_intent,
-            "trigger": self.trigger,
-            "action": self.action,
-            "target": self.target,
-            "scheduled_time": self.scheduled_time,
-            "confidence": self.confidence,
-        }
-
-
-@dataclass
-class RelativeTense:
-    before_event: str
-    after_event: str
-    relation: str
-    time_gap: Optional[str] = None
-    confidence: float = 0.85
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-
-@dataclass
-class ReportedSpeech:
-    speaker: str
-    verb: str
-    content: str
-    content_intent: Optional[IntentType] = None
-    relation: str = "said"
-    confidence: float = 0.85
-    source_text: str = ""
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-
-@dataclass
-class ContextualRole:
-    entity: str
-    role: str
-    context_phrase: str
-    temporal: Optional[str] = None
-    confidence: float = 0.85
-    source_text: str = ""
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-
-@dataclass
-class CollectiveEntity:
-    name: str
-    members: List[str]
-    collective_type: str
-    confidence: float = 0.85
-    source_text: str = ""
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-
-@dataclass
-class CompoundModality:
-    statement: str
-    base_modality: str
-    tense: str
-    strength: float
-    source_text: str = ""
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-
-@dataclass
-class VerbAnalysis:
-    lemma: str
-    tense: TenseType
-    scope: ScopeType
-    concept: Optional[ConceptType]
-    person: PersonType = "unknown"
-    number: str = "unknown"
-    mood: MoodType = "indicative"
-    polarity: PolarityType = "positive"
-    modal: ModalType = None
-    pronominal: bool = False
-    impersonal: bool = False
-    compound: bool = False
-
-
-@dataclass
-class SyntacticTree:
-    phrase: str
-    root: Optional[Any] = None
-    subject: Optional[str] = None
-    subject_role: Optional[RoleType] = None
-    object_: Optional[str] = None
-
-    def to_dict(self) -> dict:
-        return {"phrase": self.phrase, "subject": self.subject, "object": self.object_}
-
-
-@dataclass
-class RegisterAnalysis:
-    style: str = "neutre"
-    confidence: float = 0.5
-    markers: List[str] = field(default_factory=list)
-    politeness: bool = False
-
-
-# ============================================================
-# INTENT COMPLET
-# ============================================================
-
-@dataclass
-class Intent:
-    text: str
-    intent: IntentType
-    confidence: float
-    uncertain: bool
-    scores: dict
-    verb: Optional[VerbAnalysis]
-    who: Optional[PersonType]
-    who_raw: Optional[str]
-    with_who: List[str]
-    when: Optional[TemporalSpan]
-    where: Optional[str]
-    what: Optional[ConceptType]
-    action: Optional[str]
-    target: Optional[str]
-    actions: List[dict]
-    entities: List[dict]
-    memory_hint: Optional[dict]
-    register: Optional[dict]
-    assembled_from: List[str]
-    syntax_tree: Optional[SyntacticTree] = None
-    corrections: List[Tuple[str, str]] = field(default_factory=list)
-    expansions: List[Tuple[str, str]] = field(default_factory=list)
-    clause_index: int = 0
-    processing_ms: float = 0.0
-    ts: float = field(default_factory=time.time)
-
-    relations: List[Relation] = field(default_factory=list)
-    triplets: List[Tuple[str, str, str]] = field(default_factory=list)
-    coreferences: List[Coreference] = field(default_factory=list)
-    attributes: List[Attribute] = field(default_factory=list)
-    events: List[Event] = field(default_factory=list)
-    quantifiers: List[Quantifier] = field(default_factory=list)
-    negations: List[Negation] = field(default_factory=list)
-    modalities: List[Modality] = field(default_factory=list)
-    comparisons: List[Comparison] = field(default_factory=list)
-    roles: List[Role] = field(default_factory=list)
-    temporal_sequences: List[TemporalSequence] = field(default_factory=list)
-    subordinate_clauses: List[SubordinateClause] = field(default_factory=list)
-    secondary_intents: List[SecondaryIntent] = field(default_factory=list)
-    relative_tenses: List[RelativeTense] = field(default_factory=list)
-    scheduled_time: Optional[ScheduledTime] = None
-    reported_speeches: List[ReportedSpeech] = field(default_factory=list)
-    contextual_roles: List[ContextualRole] = field(default_factory=list)
-    collective_entities: List[CollectiveEntity] = field(default_factory=list)
-    compound_modalities: List[CompoundModality] = field(default_factory=list)
-    fixed_expression: Optional[Dict] = None
-    entities_set: Set[str] = field(default_factory=set)
-    facts: Set[str] = field(default_factory=set)
-
-    def to_dict(self) -> dict:
-        d = asdict(self)
-        d["relations"] = [r.to_dict() for r in self.relations]
-        d["coreferences"] = [c.to_dict() for c in self.coreferences]
-        d["attributes"] = [a.to_dict() for a in self.attributes]
-        d["events"] = [e.to_dict() for e in self.events]
-        d["quantifiers"] = [q.to_dict() for q in self.quantifiers]
-        d["negations"] = [n.to_dict() for n in self.negations]
-        d["modalities"] = [m.to_dict() for m in self.modalities]
-        d["comparisons"] = [c.to_dict() for c in self.comparisons]
-        d["roles"] = [r.to_dict() for r in self.roles]
-        d["temporal_sequences"] = [t.to_dict() for t in self.temporal_sequences]
-        d["subordinate_clauses"] = [s.to_dict() for s in self.subordinate_clauses]
-        d["secondary_intents"] = [s.to_dict() for s in self.secondary_intents]
-        d["relative_tenses"] = [r.to_dict() for r in self.relative_tenses]
-        d["reported_speeches"] = [r.to_dict() for r in self.reported_speeches]
-        d["contextual_roles"] = [c.to_dict() for c in self.contextual_roles]
-        d["collective_entities"] = [c.to_dict() for c in self.collective_entities]
-        d["compound_modalities"] = [c.to_dict() for c in self.compound_modalities]
-        if self.scheduled_time:
-            d["scheduled_time"] = self.scheduled_time.to_dict()
-        d["entities_set"] = list(self.entities_set)
-        d["facts"] = list(self.facts)
-        return d
-
-    def to_cognitive_frame(self) -> dict:
-        return {
-            "type": "intent",
-            "intent_type": self.intent,
-            "verb": self.verb.lemma if self.verb else None,
-            "concept": self.verb.concept if self.verb else None,
-            "scope": self.verb.scope if self.verb else "UNKNOWN",
-            "modal": self.verb.modal if self.verb else None,
-            "polarity": self.verb.polarity if self.verb else "positive",
-            "who": self.who,
-            "who_raw": self.who_raw,
-            "with_who": self.with_who,
-            "time_start": self.when.iso_start if self.when else None,
-            "time_end": self.when.iso_end if self.when else None,
-            "location": self.where,
-            "action": self.action,
-            "target": self.target,
-            "confidence": self.confidence,
-            "processing_ms": self.processing_ms,
-            "scheduled_time": self.scheduled_time.to_dict() if self.scheduled_time else None,
-            "relations": [r.to_dict() for r in self.relations],
-            "triplets": self.triplets,
-            "coreferences": [c.to_dict() for c in self.coreferences],
-            "attributes": [a.to_dict() for a in self.attributes],
-            "events": [e.to_dict() for e in self.events],
-            "quantifiers": [q.to_dict() for q in self.quantifiers],
-            "negations": [n.to_dict() for n in self.negations],
-            "modalities": [m.to_dict() for m in self.modalities],
-            "comparisons": [c.to_dict() for c in self.comparisons],
-            "roles": [r.to_dict() for r in self.roles],
-            "temporal_sequences": [t.to_dict() for t in self.temporal_sequences],
-            "subordinate_clauses": [s.to_dict() for s in self.subordinate_clauses],
-            "secondary_intents": [s.to_dict() for s in self.secondary_intents],
-            "relative_tenses": [r.to_dict() for r in self.relative_tenses],
-            "reported_speeches": [r.to_dict() for r in self.reported_speeches],
-            "contextual_roles": [c.to_dict() for c in self.contextual_roles],
-            "collective_entities": [c.to_dict() for c in self.collective_entities],
-            "compound_modalities": [c.to_dict() for c in self.compound_modalities],
-            "fixed_expression": self.fixed_expression,
-            "entities": list(self.entities_set),
-            "facts": list(self.facts),
-            "corrections": self.corrections,
-            "expansions": self.expansions,
-        }
-
-
-# ============================================================
-# EXTRACTEURS (version complète)
-# ============================================================
-
-class AliasExpander:
-    """Expandit les alias, sigles et expressions figées."""
-
-    @classmethod
-    def expand(cls, text: str) -> Tuple[str, List[Tuple[str, str]]]:
-        expansions = []
-        result = text
-
-        for alias, expansion in ALIAS_MAP.items():
-            pattern = re.compile(r'\b' + re.escape(alias) + r'\b', re.IGNORECASE)
-            if pattern.search(result):
-                result = pattern.sub(expansion, result)
-                expansions.append((alias, expansion))
-
-        for acronym, info in ACRONYMS.items():
-            pattern = re.compile(r'\b' + re.escape(acronym) + r'\b')
-            if pattern.search(result):
-                expansions.append((acronym, info["expansion"]))
-
-        return result, expansions
-
-    @classmethod
-    def detect_fixed_expression(cls, doc, text: str) -> Optional[Dict]:
-        text_lower = text.lower()
-        for expr, info in FIXED_EXPRESSIONS.items():
-            if expr in text_lower:
-                return {
-                    "expression": expr,
-                    "verb": info["verb"],
-                    "concept": info["concept"],
-                    "structure": info["structure"],
-                    "pronominal": info.get("pronominal", False)
-                }
-        return None
-
-
-class EnhancedTokenizer:
-    """Tokenisation améliorée pour le français."""
-
-    @classmethod
-    def preprocess(cls, text: str) -> str:
-        result = text
-        for compound in COMPOUND_WORDS:
-            result = result.replace(compound, compound.replace('-', '§'))
-        for acronym in ACRONYMS.keys():
-            result = result.replace(acronym, f"«{acronym}»")
-        return result
-
-    @classmethod
-    def postprocess(cls, tokens: List[str]) -> List[str]:
-        result = []
-        for token in tokens:
-            token = token.replace('§', '-')
-            token = token.replace('«', '').replace('»', '')
-            result.append(token)
-        return result
-
 
 class FrenchTextCorrector:
+    """Normalise le texte avant analyse NLU. SMS, dyslexie, fautes phonétiques."""
+
     COMMON_MISTAKES: Dict[str, str] = {
         "sava": "ça va", "cetais": "c'était", "cété": "c'était",
         "jsp": "je sais pas", "pk": "pourquoi", "pcq": "parce que",
@@ -849,16 +438,13 @@ class FrenchTextCorrector:
         return result, corrections
 
 
-COMMON_WORDS_FR = {
-    "je", "tu", "il", "elle", "on", "nous", "vous", "ils", "elles",
-    "le", "la", "les", "un", "une", "des", "du", "de", "et", "ou", "mais",
-    "donc", "car", "est", "sont", "était", "ai", "as", "a", "avons", "avez", "ont",
-    "vais", "vas", "va", "peux", "peut", "veux", "veut", "fais", "fait", "dis", "dit",
-    "pour", "par", "avec", "sans", "dans", "sur", "sous",
-}
-
+# ============================================================
+# SECTION 2 — FrenchVerbAnalyzer (v3)
+# ============================================================
 
 class FrenchVerbAnalyzer:
+    """Enrichit l'analyse verbale spaCy : irréguliers, formes composées, pronominal."""
+
     IRREGULAR: Dict[str, Tuple[str, str, str]] = {
         "aller": ("vais/vas/va/allons/allez/vont", "allai", "allé"),
         "avoir": ("ai/as/a/avons/avez/ont", "eus", "eu"),
@@ -916,91 +502,25 @@ class FrenchVerbAnalyzer:
         return morph_tense
 
 
-@dataclass
-class ConversationContext:
-    last_intent_type: Optional[IntentType] = None
-    last_verb_lemma: Optional[str] = None
-    last_actor: Optional[str] = None
-    last_action: Optional[str] = None
-    last_location: Optional[str] = None
-    last_when_iso: Optional[str] = None
-    timestamp: float = field(default_factory=time.time)
-
-    def is_expired(self) -> bool:
-        return time.time() - self.timestamp > CONTEXT_RESET_SEC
-
-    def update_from_intent(self, intent: "Intent"):
-        self.last_intent_type = intent.intent
-        self.last_verb_lemma = intent.verb.lemma if intent.verb else None
-        self.last_actor = intent.who_raw
-        self.last_action = intent.action or (intent.verb.lemma if intent.verb else None)
-        self.last_location = intent.where
-        self.last_when_iso = intent.when.iso_start if intent.when else None
-        self.timestamp = time.time()
-
-    def resolve_ellipsis(self, text: str) -> str:
-        if self.is_expired():
-            return text
-        tl = text.lower().strip()
-        if tl in ("oui", "ouais", "ok", "d'accord", "okay", "bien sûr"):
-            if self.last_intent_type == "query_narrative" and self.last_verb_lemma:
-                return f"oui, {self.last_verb_lemma}"
-        if tl in ("encore", "recommence", "refais", "re"):
-            if self.last_action:
-                return f"refais {self.last_action}"
-        return text
-
-    def resolve_pronouns(self, text: str) -> str:
-        if self.is_expired():
-            return text
-        result = text
-        if re.search(r'\by\b', result) and self.last_location:
-            result = re.sub(r'\by\b', self.last_location, result)
-        if re.search(r'\ben\b', result) and self.last_action:
-            result = re.sub(r'\ben\b', f"de {self.last_action}", result)
-        return result
-
+# ============================================================
+# SECTION 3 — TemporalSpan (TIMEX3)
+# ============================================================
 
 @dataclass
-class ConversationFrame:
-    who: Optional[PersonType] = None
-    who_raw: Optional[str] = None
-    with_who: List[str] = field(default_factory=list)
-    when: Optional[TemporalSpan] = None
-    where: Optional[str] = None
-    what: Optional[ConceptType] = None
-    last_update: float = field(default_factory=time.monotonic)
-    pending_fragments: List[str] = field(default_factory=list)
-    subjects: List[str] = field(default_factory=list)
-    durations: List[dict] = field(default_factory=list)
-    register: Optional[str] = None
-
-    def is_expired(self) -> bool:
-        return time.monotonic() - self.last_update > CONTEXT_RESET_SEC
-
-    def reset(self):
-        self.who = self.who_raw = self.when = self.where = self.what = self.register = None
-        self.with_who = []
-        self.pending_fragments = []
-        self.subjects = []
-        self.durations = []
-        self.last_update = time.monotonic()
-
-    def update(self, **kwargs):
-        for k, v in kwargs.items():
-            if not hasattr(self, k) or v is None:
-                continue
-            if k == "with_who":
-                self.with_who = list(set(self.with_who + v))
-            elif k == "fragment":
-                self.pending_fragments.append(v)
-            else:
-                setattr(self, k, v)
-        self.last_update = time.monotonic()
-
-    def flush_pending(self) -> List[str]:
-        frags, self.pending_fragments = list(self.pending_fragments), []
-        return frags
+class TemporalSpan:
+    """Expression temporelle normalisée TIMEX3 : DATE|TIME|DURATION|SET|INTERVAL."""
+    raw: str
+    iso_start: str
+    iso_end: str
+    timex_type: str = "DATE"
+    source: str = "dateparser"
+    duration_raw: Optional[str] = None
+    duration_unit: Optional[str] = None
+    duration_value: Optional[float] = None
+    until_raw: Optional[str] = None
+    interval_start_raw: Optional[str] = None
+    interval_end_raw: Optional[str] = None
+    named_event: Optional[dict] = None
 
 
 def _get_dateparser():
@@ -1009,11 +529,6 @@ def _get_dateparser():
         import dateparser as _dp
         _DATE_PARSER = _dp
     return _DATE_PARSER
-
-
-_DATE_PARSER = None
-_TIMEXY_CHECKED = False
-_TIMEXY_AVAILABLE = False
 
 
 def _check_timexy() -> bool:
@@ -1028,943 +543,16 @@ def _check_timexy() -> bool:
     return _TIMEXY_AVAILABLE
 
 
-class ScheduledTimeExtractor:
-    TIME_UNITS = {
-        "seconde": 1, "secondes": 1, "s": 1,
-        "minute": 60, "minutes": 60, "min": 60,
-        "heure": 3600, "heures": 3600, "h": 3600,
-        "jour": 86400, "jours": 86400, "j": 86400,
-        "semaine": 604800, "semaines": 604800, "sem": 604800,
-        "mois": 2592000,
-        "an": 31536000, "ans": 31536000, "année": 31536000, "années": 31536000,
-    }
-
-    DELAY_PATTERNS = [
-        r"dans\s+(\d+(?:[.,]\d+)?)\s*(secondes?|s?|minutes?|min?|heures?|h?|jours?|j?|semaines?|sem?|mois|ans?|années?)",
-        r"dans\s+(une|un)\s+(seconde|minute|heure|jour|semaine|mois|an|année)",
-        r"dans\s+(\d{1,2})h(\d{1,2})",
-    ]
-
-    ABSOLUTE_PATTERNS = [
-        r"le\s+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})(?:\s+à\s+(\d{1,2})[h:](\d{0,2}))?",
-        r"le\s+(\d{1,2})\s+(janvier|février|mars|avril|mai|juin|juillet|août|septembre|octobre|novembre|décembre)(?:\s+(\d{4}))?(?:\s+à\s+(\d{1,2})[h:](\d{0,2}))?",
-        r"à\s+(\d{1,2})[h:](\d{0,2})",
-        r"(\d{1,2})[h:](\d{0,2})",
-        r"(\d{1,2}):(\d{2})",
-        r"demain\s+à\s+(\d{1,2})[h:](\d{0,2})",
-        r"ce\s+(soir|matin|après-midi)",
-    ]
-
-    RECURRING_PATTERNS = [
-        (r"tous\s+les\s+(jours|soirs|matins)", "daily"),
-        (r"chaque\s+(jour|soir|matin)", "daily"),
-        (r"toutes\s+les\s+(semaines|semaine)", "weekly"),
-        (r"chaque\s+semaine", "weekly"),
-        (r"tous\s+les\s+(mois|mois)", "monthly"),
-        (r"chaque\s+mois", "monthly"),
-    ]
-
-    @classmethod
-    def extract(cls, text: str, ref: datetime.datetime = None) -> Optional[ScheduledTime]:
-        if ref is None:
-            ref = datetime.datetime.now()
-
-        text_lower = text.lower()
-
-        is_recurring = False
-        recurrence_rule = None
-        for pattern, rule in cls.RECURRING_PATTERNS:
-            if re.search(pattern, text_lower, re.IGNORECASE):
-                is_recurring = True
-                recurrence_rule = rule
-                break
-
-        for pattern in cls.DELAY_PATTERNS:
-            match = re.search(pattern, text_lower)
-            if match:
-                return cls._parse_delay(match, ref, is_recurring, recurrence_rule)
-
-        for pattern in cls.ABSOLUTE_PATTERNS:
-            match = re.search(pattern, text_lower)
-            if match:
-                return cls._parse_absolute(match, ref, is_recurring, recurrence_rule)
-
-        return None
-
-    @classmethod
-    def _parse_delay(cls, match, ref, is_recurring, recurrence_rule) -> Optional[ScheduledTime]:
-        groups = match.groups()
-        raw = match.group(0)
-
-        if len(groups) >= 2 and groups[1] and groups[0] and not groups[0].isalpha():
-            try:
-                hours = int(groups[0])
-                mins = int(groups[1]) if groups[1] else 0
-                total_seconds = hours * 3600 + mins * 60
-                target = ref + datetime.timedelta(seconds=total_seconds)
-                return ScheduledTime(
-                    raw=raw, iso=target.isoformat(),
-                    human=target.strftime("%A %d %B %Y à %H:%M"),
-                    delay_seconds=total_seconds,
-                    is_recurring=is_recurring, recurrence_rule=recurrence_rule,
-                )
-            except (ValueError, TypeError):
-                pass
-
-        if groups[0] in ("une", "un"):
-            unit = groups[1] if len(groups) > 1 else groups[0]
-            unit_clean = unit.rstrip("s")
-            seconds = cls.TIME_UNITS.get(unit_clean, 0)
-            target = ref + datetime.timedelta(seconds=seconds)
-            return ScheduledTime(
-                raw=raw, iso=target.isoformat(),
-                human=target.strftime("%A %d %B %Y à %H:%M"),
-                delay_seconds=seconds,
-                is_recurring=is_recurring, recurrence_rule=recurrence_rule,
-            )
-
-        try:
-            value = float(groups[0].replace(",", "."))
-            unit = groups[1].rstrip("s")
-            seconds = int(value * cls.TIME_UNITS.get(unit, 0))
-            target = ref + datetime.timedelta(seconds=seconds)
-            return ScheduledTime(
-                raw=raw, iso=target.isoformat(),
-                human=target.strftime("%A %d %B %Y à %H:%M"),
-                delay_seconds=seconds,
-                is_recurring=is_recurring, recurrence_rule=recurrence_rule,
-            )
-        except (ValueError, TypeError, KeyError):
-            pass
-
-        return None
-
-    @classmethod
-    def _parse_absolute(cls, match, ref, is_recurring, recurrence_rule) -> Optional[ScheduledTime]:
-        groups = match.groups()
-        raw = match.group(0)
-
-        if "demain" in raw.lower():
-            target = ref + datetime.timedelta(days=1)
-            hour = int(groups[0]) if groups[0] else 20
-            minute = int(groups[1]) if len(groups) > 1 and groups[1] else 0
-            target = target.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            return ScheduledTime(
-                raw=raw, iso=target.isoformat(),
-                human=target.strftime("%A %d %B %Y à %H:%M"),
-                is_recurring=is_recurring, recurrence_rule=recurrence_rule,
-            )
-
-        if "ce soir" in raw.lower():
-            target = ref.replace(hour=20, minute=0, second=0, microsecond=0)
-            if target < ref:
-                target += datetime.timedelta(days=1)
-            return ScheduledTime(
-                raw=raw, iso=target.isoformat(),
-                human=target.strftime("%A %d %B %Y à %H:%M"),
-                is_recurring=is_recurring, recurrence_rule=recurrence_rule,
-            )
-
-        if "ce matin" in raw.lower():
-            target = ref.replace(hour=8, minute=0, second=0, microsecond=0)
-            if target < ref:
-                target += datetime.timedelta(days=1)
-            return ScheduledTime(
-                raw=raw, iso=target.isoformat(),
-                human=target.strftime("%A %d %B %Y à %H:%M"),
-                is_recurring=is_recurring, recurrence_rule=recurrence_rule,
-            )
-
-        if "cet après-midi" in raw.lower():
-            target = ref.replace(hour=14, minute=0, second=0, microsecond=0)
-            if target < ref:
-                target += datetime.timedelta(days=1)
-            return ScheduledTime(
-                raw=raw, iso=target.isoformat(),
-                human=target.strftime("%A %d %B %Y à %H:%M"),
-                is_recurring=is_recurring, recurrence_rule=recurrence_rule,
-            )
-
-        if len(groups) >= 2 and groups[0] and groups[0].isdigit() and len(groups[0]) <= 2:
-            hour = int(groups[0])
-            minute = int(groups[1]) if groups[1] else 0
-            target = ref.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            if target < ref:
-                target += datetime.timedelta(days=1)
-            return ScheduledTime(
-                raw=raw, iso=target.isoformat(),
-                human=target.strftime("%A %d %B %Y à %H:%M"),
-                is_recurring=is_recurring, recurrence_rule=recurrence_rule,
-            )
-
-        if len(groups) >= 3 and groups[0]:
-            date_str = groups[0]
-            hour = int(groups[2]) if len(groups) > 2 and groups[2] else 0
-            minute = int(groups[3]) if len(groups) > 3 and groups[3] else 0
-
-            if DATEPARSER_AVAILABLE:
-                dt = dateparser.parse(date_str, languages=["fr"])
-                if dt:
-                    target = dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
-                    return ScheduledTime(
-                        raw=raw, iso=target.isoformat(),
-                        human=target.strftime("%A %d %B %Y à %H:%M"),
-                        is_recurring=is_recurring, recurrence_rule=recurrence_rule,
-                    )
-
-        return None
-
-
-class RelationExtractor:
-    FR_TO_PREDICATE = {
-        "fils": "SON_OF", "fille": "DAUGHTER_OF", "père": "FATHER_OF",
-        "mère": "MOTHER_OF", "frère": "BROTHER_OF", "soeur": "SISTER_OF",
-        "mari": "HUSBAND_OF", "femme": "WIFE_OF", "parent": "PARENT_OF",
-        "enfant": "CHILD_OF", "possède": "OWNS", "appartient": "BELONGS_TO",
-        "ami": "FRIEND_OF", "collègue": "COLLEAGUE_OF", "voisin": "NEIGHBOR_OF",
-        "donne": "GIVES_TO", "envoie": "SENDS_TO", "reçoit": "RECEIVES_FROM",
-    }
-
-    PREP_TO_PREDICATE = {
-        "de": "BELONGS_TO", "du": "BELONGS_TO", "des": "BELONGS_TO",
-        "à": "GOES_TO", "au": "GOES_TO", "avec": "ACCOMPANIED_BY",
-        "pour": "FOR", "sans": "WITHOUT", "dans": "LOCATED_IN",
-        "sur": "ON", "sous": "UNDER", "chez": "AT", "vers": "TOWARDS",
-    }
-
-    @classmethod
-    def extract(cls, doc) -> List[Relation]:
-        relations = []
-        relations.extend(cls._extract_nmod_relations(doc))
-        relations.extend(cls._extract_prep_relations(doc))
-        relations.extend(cls._extract_copula_relations(doc))
-        relations.extend(cls._extract_verb_relations(doc))
-        relations.extend(cls._extract_coordination_relations(doc))
-        relations.extend(cls._extract_relative_clause_relations(doc))
-        relations.extend(cls._extract_presentation_relations(doc))
-        return relations
-
-    @classmethod
-    def _extract_coordination_relations(cls, doc) -> List[Relation]:
-        relations = []
-        for token in doc:
-            if token.dep_ == "cc" and token.text.lower() in ("et", "ou"):
-                conj = token.head
-                if conj.dep_ == "conj":
-                    left = None
-                    right = None
-                    for child in conj.children:
-                        if child.dep_ == "conj" and child.i < conj.i:
-                            left = child.text
-                        elif child.dep_ == "conj" and child.i > conj.i:
-                            right = child.text
-                    if left and right:
-                        relations.append(Relation(
-                            subject=left, predicate="COORDINATED_WITH",
-                            object=right, confidence=0.85,
-                            source_text=f"{left} {token.text} {right}",
-                            tags=["coordination"],
-                        ))
-        return relations
-
-    @classmethod
-    def _extract_relative_clause_relations(cls, doc) -> List[Relation]:
-        relations = []
-        for token in doc:
-            if token.dep_ == "relcl" and token.pos_ == "VERB":
-                antecedent = None
-                for child in token.children:
-                    if child.dep_ == "nsubj":
-                        antecedent = child.text
-                        break
-                object_ = None
-                for child in doc:
-                    if child.dep_ == "obj" and child.head == token:
-                        object_ = child.text
-                        break
-                if antecedent and object_:
-                    relations.append(Relation(
-                        subject=antecedent, predicate="RELATIVE_TO",
-                        object=object_, confidence=0.80,
-                        source_text=f"{antecedent} {token.text} {object_}",
-                        tags=["relative_clause"],
-                    ))
-        return relations
-
-    @classmethod
-    def _extract_presentation_relations(cls, doc) -> List[Relation]:
-        relations = []
-        for token in doc:
-            if token.text.lower() == "c'" and token.head.text.lower() == "est":
-                verb = token.head
-                for child in verb.children:
-                    if child.dep_ == "attr":
-                        subject = child.text
-                    if child.dep_ == "advcl" and child.text.lower() == "qui":
-                        for grandchild in child.children:
-                            if grandchild.dep_ == "ROOT":
-                                action = grandchild.lemma_
-                                for gchild in grandchild.children:
-                                    if gchild.dep_ == "obj":
-                                        object_ = gchild.text
-                                if subject and action:
-                                    relations.append(Relation(
-                                        subject=subject, predicate=action.upper(),
-                                        object=object_, confidence=0.85,
-                                        source_text=f"c'est {subject} qui {grandchild.text}",
-                                        tags=["presentation"],
-                                    ))
-        return relations
-
-    @classmethod
-    def _extract_nmod_relations(cls, doc) -> List[Relation]:
-        relations = []
-        for token in doc:
-            if token.dep_ == "nmod" and token.head.pos_ in ("NOUN", "PROPN"):
-                subject = token.head.text
-                preposition = None
-                object_ = None
-                for child in token.children:
-                    if child.dep_ == "case":
-                        preposition = child.text.lower()
-                    elif child.dep_ == "nmod" or child.pos_ == "NOUN":
-                        object_ = child.text
-                if object_:
-                    predicate = cls.FR_TO_PREDICATE.get(subject.lower(), "UNKNOWN")
-                    if predicate == "UNKNOWN" and preposition:
-                        predicate = cls.PREP_TO_PREDICATE.get(preposition, "UNKNOWN")
-                    relations.append(Relation(
-                        subject=subject, predicate=predicate, object=object_,
-                        confidence=0.85 if predicate != "UNKNOWN" else 0.5,
-                        source_text=f"{subject} {preposition or ''} {object_}",
-                        is_known=predicate != "UNKNOWN",
-                        unknown_text=subject if predicate == "UNKNOWN" else None,
-                    ))
-        return relations
-
-    @classmethod
-    def _extract_prep_relations(cls, doc) -> List[Relation]:
-        relations = []
-        for token in doc:
-            if token.dep_ == "prep":
-                preposition = token.text.lower()
-                parent = token.head
-                object_ = None
-                for child in token.children:
-                    if child.dep_ == "pobj":
-                        object_ = child.text
-                        break
-                if object_ and parent.pos_ in ("VERB", "NOUN", "PROPN"):
-                    subject = cls._find_subject(doc, parent)
-                    predicate = cls.PREP_TO_PREDICATE.get(preposition, "UNKNOWN")
-                    relations.append(Relation(
-                        subject=subject or parent.text, predicate=predicate, object=object_,
-                        confidence=0.80 if predicate != "UNKNOWN" else 0.5,
-                        source_text=f"{parent.text} {preposition} {object_}",
-                        is_known=predicate != "UNKNOWN",
-                        unknown_text=preposition if predicate == "UNKNOWN" else None,
-                    ))
-        return relations
-
-    @classmethod
-    def _extract_copula_relations(cls, doc) -> List[Relation]:
-        relations = []
-        for token in doc:
-            if token.lemma_ in ("être", "devenir") and token.dep_ == "ROOT":
-                subject = cls._find_subject(doc, token)
-                if not subject:
-                    continue
-                for child in token.children:
-                    if child.dep_ == "attr" and child.pos_ in ("NOUN", "PROPN", "ADJ"):
-                        attribute = child.text
-                        has_nmod = False
-                        for grandchild in child.children:
-                            if grandchild.dep_ == "nmod":
-                                obj = cls._extract_nmod_object(grandchild)
-                                if obj:
-                                    predicate = cls.FR_TO_PREDICATE.get(attribute.lower(), "UNKNOWN")
-                                    relations.append(Relation(
-                                        subject=subject, predicate=predicate, object=obj,
-                                        confidence=0.90, source_text=f"{attribute} de {obj}",
-                                        is_known=predicate != "UNKNOWN",
-                                    ))
-                                    has_nmod = True
-                        if not has_nmod:
-                            relations.append(Relation(
-                                subject=subject, predicate="IS", object=attribute,
-                                confidence=0.70, source_text=f"{subject} est {attribute}",
-                                is_known=True,
-                            ))
-        return relations
-
-    @classmethod
-    def _extract_verb_relations(cls, doc) -> List[Relation]:
-        relations = []
-        for token in doc:
-            if token.pos_ == "VERB" and token.dep_ == "ROOT":
-                subject = cls._find_subject(doc, token)
-                direct_object = cls._find_direct_object(token)
-                for child in token.children:
-                    if child.dep_ == "prep":
-                        indirect_object = cls._find_pobj(child)
-                        if indirect_object:
-                            predicate = cls.PREP_TO_PREDICATE.get(child.text.lower(), "UNKNOWN")
-                            if token.lemma_ == "donner" and child.text.lower() == "à":
-                                predicate = "GIVES_TO"
-                            relations.append(Relation(
-                                subject=subject, predicate=predicate, object=indirect_object,
-                                confidence=0.85,
-                                source_text=f"{subject} {token.text} {direct_object or ''} {child.text} {indirect_object}",
-                                arguments={"direct_object": direct_object} if direct_object else {},
-                                is_known=predicate != "UNKNOWN",
-                            ))
-        return relations
-
-    @classmethod
-    def _find_subject(cls, doc, token) -> Optional[str]:
-        for child in token.children:
-            if child.dep_ in ("nsubj", "nsubj:pass"):
-                return child.text
-        return None
-
-    @classmethod
-    def _find_direct_object(cls, token) -> Optional[str]:
-        for child in token.children:
-            if child.dep_ == "obj":
-                return child.text
-        return None
-
-    @classmethod
-    def _find_pobj(cls, prep_token) -> Optional[str]:
-        for child in prep_token.children:
-            if child.dep_ == "pobj":
-                return child.text
-        return None
-
-    @classmethod
-    def _extract_nmod_object(cls, nmod_token) -> Optional[str]:
-        for child in nmod_token.children:
-            if child.dep_ == "case":
-                continue
-            if child.pos_ in ("NOUN", "PROPN"):
-                return child.text
-        return None
-
-
-class CoreferenceExtractor:
-    PRONOUNS = {
-        "il": {"gender": "M", "number": "S", "type": "subject"},
-        "elle": {"gender": "F", "number": "S", "type": "subject"},
-        "ils": {"gender": "M", "number": "P", "type": "subject"},
-        "elles": {"gender": "F", "number": "P", "type": "subject"},
-        "le": {"gender": "M", "number": "S", "type": "object"},
-        "la": {"gender": "F", "number": "S", "type": "object"},
-        "les": {"gender": "M", "number": "P", "type": "object"},
-        "lui": {"gender": "M", "number": "S", "type": "indirect"},
-        "leur": {"gender": "M", "number": "P", "type": "indirect"},
-        "y": {"gender": None, "number": None, "type": "place"},
-        "en": {"gender": None, "number": None, "type": "quantity"},
-    }
-
-    @classmethod
-    def extract(cls, doc) -> List[Coreference]:
-        coreferences = []
-
-        if hasattr(doc, "_.coref_clusters"):
-            for cluster_id, cluster in enumerate(doc._.coref_clusters):
-                mentions = list(cluster.mentions)
-                if len(mentions) >= 2:
-                    antecedent = mentions[0].text
-                    for mention in mentions[1:]:
-                        if mention.text.lower() != antecedent.lower():
-                            coreferences.append(Coreference(
-                                pronoun=mention.text,
-                                antecedent=antecedent,
-                                position_pronoun=mention.start,
-                                position_antecedent=mentions[0].start,
-                                confidence=0.95,
-                                cluster_id=cluster_id,
-                            ))
-        else:
-            coreferences.extend(cls._simple_coreference(doc))
-
-        coreferences.extend(cls._object_pronoun_coreference(doc))
-
-        return coreferences
-
-    @classmethod
-    def _simple_coreference(cls, doc) -> List[Coreference]:
-        coreferences = []
-        entities = []
-
-        for token in doc:
-            if token.ent_type_ == "PER":
-                entities.append({"text": token.text, "position": token.i, "type": "entity"})
-            elif token.pos_ == "NOUN" and token.dep_ in ("nsubj", "obj"):
-                entities.append({"text": token.text, "position": token.i, "type": "noun"})
-
-        for token in doc:
-            if token.pos_ == "PRON" and token.text.lower() in cls.PRONOUNS:
-                for ent in reversed(entities):
-                    if ent["position"] < token.i:
-                        distance = token.i - ent["position"]
-                        confidence = 0.9 if distance <= 5 else 0.8 if distance <= 10 else 0.7
-                        coreferences.append(Coreference(
-                            pronoun=token.text,
-                            antecedent=ent["text"],
-                            position_pronoun=token.i,
-                            position_antecedent=ent["position"],
-                            confidence=confidence,
-                        ))
-                        break
-
-        return coreferences
-
-    @classmethod
-    def _object_pronoun_coreference(cls, doc) -> List[Coreference]:
-        coreferences = []
-        for token in doc:
-            if token.pos_ == "PRON" and token.text.lower() in ("le", "la", "les", "lui", "leur"):
-                for verb in doc:
-                    if verb.pos_ == "VERB":
-                        for child in verb.children:
-                            if child.dep_ == "obj":
-                                coreferences.append(Coreference(
-                                    pronoun=token.text,
-                                    antecedent=child.text,
-                                    position_pronoun=token.i,
-                                    position_antecedent=child.i,
-                                    confidence=0.85,
-                                ))
-                                return coreferences
-        return coreferences
-
-
-class AttributeExtractor:
-    @classmethod
-    def extract(cls, doc) -> List[Attribute]:
-        attributes = []
-
-        for token in doc:
-            if token.lemma_ in ("être", "devenir", "sembler", "paraître") and token.dep_ == "ROOT":
-                subject = None
-                attr = None
-                for child in token.children:
-                    if child.dep_ in ("nsubj", "nsubj:pass"):
-                        subject = child.text
-                    if child.dep_ == "attr" and child.pos_ in ("NOUN", "PROPN", "ADJ"):
-                        attr = child.text
-                if subject and attr:
-                    is_temporary = token.lemma_ in ("être", "sembler", "paraître")
-                    attributes.append(Attribute(
-                        entity=subject, attribute=attr,
-                        attribute_type="state" if attr in ("fatigué", "heureux", "triste") else "quality",
-                        is_temporary=is_temporary, is_epithet=False,
-                        source_text=f"{subject} {token.text} {attr}"
-                    ))
-
-        for token in doc:
-            if token.dep_ == "amod":
-                attributes.append(Attribute(
-                    entity=token.head.text, attribute=token.text,
-                    attribute_type="quality", confidence=0.85,
-                    is_temporary=False, is_epithet=True,
-                    source_text=f"{token.head.text} {token.text}"
-                ))
-
-        for token in doc:
-            if token.pos_ == "ADJ" and token.dep_ not in ("amod", "attr"):
-                for child in token.head.children:
-                    if child.pos_ in ("NOUN", "PROPN"):
-                        attributes.append(Attribute(
-                            entity=child.text, attribute=token.text,
-                            attribute_type="quality", confidence=0.75,
-                            is_temporary=True, is_epithet=False,
-                            source_text=f"{child.text} {token.text}"
-                        ))
-                        break
-
-        return attributes
-
-
-class EventExtractor:
-    @classmethod
-    def extract(cls, doc) -> List[Event]:
-        events = []
-        for token in doc:
-            if token.pos_ == "VERB" and token.dep_ == "ROOT":
-                actor = None
-                patient = None
-                instrument = None
-                location = None
-                time = None
-
-                for child in token.children:
-                    if child.dep_ in ("nsubj", "nsubj:pass"):
-                        actor = child.text
-                    if child.dep_ == "obj":
-                        patient = child.text
-                    if child.dep_ == "obl":
-                        for grandchild in child.children:
-                            if grandchild.text.lower() in ("avec", "en utilisant", "à l'aide de"):
-                                instrument = child.text
-                                break
-                        for grandchild in child.children:
-                            if grandchild.text.lower() in ("dans", "à", "sur", "chez"):
-                                location = child.text
-                                break
-
-                for ent in doc.ents:
-                    if ent.label_ in ("DATE", "TIME"):
-                        time = ent.text
-
-                events.append(Event(
-                    action=token.lemma_,
-                    actor=actor,
-                    patient=patient,
-                    instrument=instrument,
-                    location=location,
-                    time=time,
-                    source_text=token.text
-                ))
-        return events
-
-
-class SubordinateClauseExtractor:
-    SUBORDINATE_CONJUNCTIONS = {
-        "parce que": "cause", "car": "cause", "puisque": "cause",
-        "bien que": "concession", "quoique": "concession", "même si": "concession",
-        "si": "condition", "à condition que": "condition", "pourvu que": "condition",
-        "quand": "time", "lorsque": "time", "après que": "time",
-        "avant que": "time", "pendant que": "time", "pour que": "purpose",
-        "afin que": "purpose",
-    }
-
-    @classmethod
-    def extract(cls, doc) -> List[SubordinateClause]:
-        clauses = []
-        for token in doc:
-            if token.dep_ == "mark" and token.text.lower() in cls.SUBORDINATE_CONJUNCTIONS:
-                relation = cls.SUBORDINATE_CONJUNCTIONS[token.text.lower()]
-                sub_clause_token = token.head
-                sub_clause = sub_clause_token.text
-                main_clause = None
-                for parent in sub_clause_token.ancestors:
-                    if parent.dep_ == "ROOT":
-                        main_clause = parent.text
-                        break
-                if main_clause and sub_clause:
-                    clauses.append(SubordinateClause(
-                        main_clause=main_clause,
-                        sub_clause=sub_clause,
-                        relation=relation,
-                        source_text=token.text,
-                    ))
-        return clauses
-
-
-class SecondaryIntentExtractor:
-    SECONDARY_TYPES = {
-        "reminder": ["rappelle-moi", "souviens-toi", "pense à", "n'oublie pas de"],
-        "scheduled_action": ["dans", "le", "à", "demain", "ce soir", "ce matin", "cet après-midi"],
-        "warning": ["attention", "prudence", "danger"],
-        "condition": ["si", "à condition que"],
-        "suggestion": ["peut-être", "tu pourrais", "si tu veux"],
-        "obligation": ["tu dois", "il faut", "absolument"],
-    }
-
-    @classmethod
-    def extract(cls, doc, primary_intent: str, scheduled_time: dict = None) -> List[SecondaryIntent]:
-        intents = []
-        text_lower = doc.text.lower()
-
-        for intent_type, triggers in cls.SECONDARY_TYPES.items():
-            for trigger in triggers:
-                if trigger in text_lower:
-                    action, target = cls._extract_action_target(doc)
-                    intents.append(SecondaryIntent(
-                        primary_intent=primary_intent,
-                        secondary_intent=intent_type,
-                        trigger=trigger,
-                        action=action,
-                        target=target,
-                        scheduled_time=scheduled_time,
-                        confidence=0.85 if action else 0.7,
-                    ))
-        return intents
-
-    @classmethod
-    def _extract_action_target(cls, doc) -> Tuple[Optional[str], Optional[str]]:
-        for token in doc:
-            if token.pos_ == "VERB" and token.dep_ == "ROOT":
-                action = token.lemma_
-                target = None
-                for child in token.children:
-                    if child.dep_ == "obj":
-                        target = child.text
-                        break
-                return action, target
-        return None, None
-
-
-class RelativeTenseExtractor:
-    TENSE_MARKERS = {
-        "avant": "before", "avant que": "before", "avant de": "before",
-        "après": "after", "après que": "after", "après avoir": "after",
-        "puis": "after", "ensuite": "after", "alors": "after",
-        "pendant": "during", "pendant que": "during",
-        "en même temps": "simultaneous", "alors que": "simultaneous", "tandis que": "simultaneous",
-        "depuis": "since", "jusqu'à": "until",
-    }
-
-    @classmethod
-    def extract(cls, doc) -> List[RelativeTense]:
-        tenses = []
-        for i, token in enumerate(doc):
-            marker = None
-            for m in cls.TENSE_MARKERS:
-                if m in token.text.lower() or (i + 1 < len(doc) and f"{token.text.lower()} {doc[i+1].text.lower()}" == m):
-                    marker = m
-                    break
-
-            if marker:
-                relation = cls.TENSE_MARKERS[marker]
-                before_event = cls._find_event_before(doc, token.i)
-                after_event = cls._find_event_after(doc, token.i)
-
-                if before_event and after_event:
-                    tenses.append(RelativeTense(
-                        before_event=before_event,
-                        after_event=after_event,
-                        relation=relation,
-                        time_gap=cls._extract_time_gap(doc, token.i),
-                        confidence=0.85,
-                    ))
-                elif before_event and relation in ("after", "since"):
-                    tenses.append(RelativeTense(
-                        before_event=before_event,
-                        after_event=cls._find_event_main_verb(doc),
-                        relation=relation,
-                        confidence=0.80,
-                    ))
-                elif after_event and relation in ("before", "until"):
-                    tenses.append(RelativeTense(
-                        before_event=cls._find_event_main_verb(doc),
-                        after_event=after_event,
-                        relation=relation,
-                        confidence=0.80,
-                    ))
-
-        return tenses
-
-    @classmethod
-    def _find_event_before(cls, doc, position) -> Optional[str]:
-        for i in range(position - 1, -1, -1):
-            if doc[i].pos_ == "VERB":
-                return doc[i].lemma_
-        return None
-
-    @classmethod
-    def _find_event_after(cls, doc, position) -> Optional[str]:
-        for i in range(position + 1, len(doc)):
-            if doc[i].pos_ == "VERB":
-                return doc[i].lemma_
-        return None
-
-    @classmethod
-    def _find_event_main_verb(cls, doc) -> Optional[str]:
-        for token in doc:
-            if token.pos_ == "VERB" and token.dep_ == "ROOT":
-                return token.lemma_
-        return None
-
-    @classmethod
-    def _extract_time_gap(cls, doc, position) -> Optional[str]:
-        for i in range(max(0, position - 5), min(len(doc), position + 5)):
-            if doc[i].like_num:
-                for j in range(i + 1, min(i + 3, len(doc))):
-                    if doc[j].text.lower() in ("heure", "heures", "jour", "jours", "semaine", "semaines", "mois", "an", "ans"):
-                        return f"{doc[i].text} {doc[j].text}"
-        return None
-
-
-class ReportedSpeechExtractor:
-    REPORTING_VERBS = {
-        "dire": "said", "raconter": "told", "expliquer": "explained",
-        "penser": "thought", "croire": "believed", "savoir": "knew",
-        "espérer": "hoped", "souhaiter": "wished", "craindre": "feared",
-        "affirmer": "affirmed", "prétendre": "claimed", "annoncer": "announced",
-    }
-
-    @classmethod
-    def extract(cls, doc) -> List[ReportedSpeech]:
-        results = []
-        for token in doc:
-            if token.lemma_ in cls.REPORTING_VERBS and token.dep_ == "ROOT":
-                speaker = cls._find_subject(doc, token)
-                for child in token.children:
-                    if child.text.lower() == "que" and child.dep_ == "mark":
-                        reported = cls._extract_complement_clause(child)
-                        if speaker and reported:
-                            reported_intent = cls._guess_intent(reported)
-                            results.append(ReportedSpeech(
-                                speaker=speaker,
-                                verb=token.lemma_,
-                                content=reported,
-                                content_intent=reported_intent,
-                                relation=cls.REPORTING_VERBS[token.lemma_],
-                                source_text=f"{speaker} {token.text} que {reported}"
-                            ))
-        return results
-
-    @classmethod
-    def _find_subject(cls, doc, token) -> Optional[str]:
-        for child in token.children:
-            if child.dep_ in ("nsubj", "nsubj:pass"):
-                return child.text
-        return None
-
-    @classmethod
-    def _extract_complement_clause(cls, que_token) -> str:
-        words = []
-        for token in que_token.doc[que_token.i + 1:]:
-            if token.dep_ == "ROOT" or token.dep_ == "conj":
-                words.append(token.text)
-                if token.text in (".", "!", "?", ";", ","):
-                    break
-            else:
-                words.append(token.text)
-        return " ".join(words[:20])
-
-    @classmethod
-    def _guess_intent(cls, text: str) -> Optional[IntentType]:
-        text_lower = text.lower()
-        if any(w in text_lower for w in ["allume", "éteins", "ouvre"]):
-            return "action_device"
-        if "?" in text_lower:
-            return "query_state"
-        if any(w in text_lower for w in ["bonjour", "merci", "salut"]):
-            return "chit_chat"
-        return "information_input"
-
-
-class ContextualRoleExtractor:
-    ROLE_TRIGGERS = {"en tant que", "comme", "en qualité de"}
-
-    @classmethod
-    def extract(cls, doc) -> List[ContextualRole]:
-        results = []
-        text_lower = doc.text.lower()
-
-        for trigger in cls.ROLE_TRIGGERS:
-            if trigger in text_lower:
-                match = re.search(r"(\w+)\s+" + trigger.replace(" ", r"\s+") + r"\s+([\w\s]+?)(?:[.,]|$)", text_lower)
-                if match:
-                    results.append(ContextualRole(
-                        entity=match.group(1).strip(),
-                        role=match.group(2).strip(),
-                        context_phrase=trigger,
-                        source_text=match.group(0)
-                    ))
-        return results
-
-
-class CollectiveEntityExtractor:
-    COLLECTIVE_NOUNS = {
-        "équipe": "team", "groupe": "group", "famille": "family",
-        "association": "association", "club": "club", "comité": "committee",
-        "équipage": "crew", "public": "audience", "foule": "crowd"
-    }
-
-    @classmethod
-    def extract(cls, doc) -> List[CollectiveEntity]:
-        results = []
-        for token in doc:
-            if token.lemma_ in cls.COLLECTIVE_NOUNS and token.pos_ == "NOUN":
-                collective_type = cls.COLLECTIVE_NOUNS[token.lemma_]
-                members = cls._extract_members(token)
-                results.append(CollectiveEntity(
-                    name=token.text,
-                    members=members,
-                    collective_type=collective_type,
-                    source_text=token.text
-                ))
-        return results
-
-    @classmethod
-    def _extract_members(cls, noun_token) -> List[str]:
-        members = []
-        for child in noun_token.children:
-            if child.dep_ == "nmod":
-                members.append(child.text)
-        return members
-
-
-class EnhancedComparisonExtractor:
-    @classmethod
-    def extract(cls, doc) -> List[Comparison]:
-        comparisons = []
-
-        for token in doc:
-            if token.text.lower() == "plus" and token.dep_ == "advmod":
-                for child in token.children:
-                    if child.dep_ == "amod":
-                        attribute = child.text
-                        subject = cls._find_subject_of_adj(child)
-                        if subject and attribute:
-                            comparisons.append(Comparison(
-                                subject=subject, comparator="plus", attribute=attribute,
-                                object="groupe_implicite", degree="superlative", confidence=0.85
-                            ))
-
-        for token in doc:
-            if token.text.lower() == "moins" and token.dep_ == "advmod":
-                for child in token.children:
-                    if child.dep_ == "obj":
-                        comparisons.append(Comparison(
-                            subject=child.text, comparator="moins", attribute="quantité",
-                            object="implicite", degree="inferiority", confidence=0.80
-                        ))
-
-        return comparisons
-
-    @classmethod
-    def _find_subject_of_adj(cls, adj_token) -> Optional[str]:
-        for child in adj_token.children:
-            if child.dep_ == "nsubj":
-                return child.text
-        return None
-
-
-class CompoundModalityExtractor:
-    @classmethod
-    def extract(cls, doc, verb: VerbAnalysis) -> List[CompoundModality]:
-        results = []
-        if not verb:
-            return results
-
-        if verb.mood == "conditional" and verb.tense == "past":
-            if verb.modal == "obligation":
-                results.append(CompoundModality(
-                    statement=doc.text,
-                    base_modality="obligation",
-                    tense="past",
-                    strength=0.9,
-                    source_text=doc.text
-                ))
-            elif verb.modal == "possibility":
-                results.append(CompoundModality(
-                    statement=doc.text,
-                    base_modality="possibility",
-                    tense="past",
-                    strength=0.8,
-                    source_text=doc.text
-                ))
-
-        return results
-
+# ============================================================
+# SECTION 4 — FrenchTemporalResolver (CORRIGÉ: prefer dans cache)
+# ============================================================
 
 class FrenchTemporalResolver:
+    """
+    Résout les expressions temporelles françaises.
+    Cache LRU avec prefer dans la clé.
+    """
+
     MOMENTS = {
         "midi": (12, 12, "point"), "minuit": (0, 0, "point"),
         "matin": (6, 12, "interval"), "matinée": (6, 12, "interval"),
@@ -1997,14 +585,25 @@ class FrenchTemporalResolver:
         "hiver": ["hiver", "cet hiver", "en hiver"],
     }
 
-    RELATIVE_DAYS = {"aujourd'hui": 0, "demain": 1, "après-demain": 2, "hier": -1, "avant-hier": -2}
-    WEEKDAYS = {"lundi": 0, "mardi": 1, "mercredi": 2, "jeudi": 3, "vendredi": 4, "samedi": 5, "dimanche": 6}
+    RELATIVE_DAYS = {
+        "aujourd'hui": 0, "demain": 1, "après-demain": 2,
+        "hier": -1, "avant-hier": -2,
+    }
+
+    WEEKDAYS = {
+        "lundi": 0, "mardi": 1, "mercredi": 2, "jeudi": 3,
+        "vendredi": 4, "samedi": 5, "dimanche": 6,
+    }
 
     HOLIDAY_NAMES = {
-        "nouvel an": "01-01", "1er janvier": "01-01", "1er mai": "05-01", "fête du travail": "05-01",
-        "8 mai": "05-08", "victoire": "05-08", "14 juillet": "07-14", "fête nationale": "07-14",
-        "15 août": "08-15", "assomption": "08-15", "1er novembre": "11-01", "toussaint": "11-01",
-        "11 novembre": "11-11", "armistice": "11-11", "noël": "12-25", "25 décembre": "12-25",
+        "nouvel an": "01-01", "1er janvier": "01-01",
+        "1er mai": "05-01", "fête du travail": "05-01",
+        "8 mai": "05-08", "victoire": "05-08",
+        "14 juillet": "07-14", "fête nationale": "07-14",
+        "15 août": "08-15", "assomption": "08-15",
+        "1er novembre": "11-01", "toussaint": "11-01",
+        "11 novembre": "11-11", "armistice": "11-11",
+        "noël": "12-25", "25 décembre": "12-25",
     }
 
     def __init__(self):
@@ -2022,21 +621,24 @@ class FrenchTemporalResolver:
             return f"PT{sec // 60}M"
         return f"PT{sec}S"
 
+    # CORRECTION: prefer ajouté dans la clé du cache
     @lru_cache(maxsize=CACHE_SIZE)
-    def _cached_resolve(self, text: str, ref_iso: str) -> Optional[dict]:
+    def _cached_resolve(self, text: str, ref_iso: str, prefer: str) -> Optional[dict]:
+        """Résolution avec cache LRU — clé = (text, ref_iso, prefer)."""
         self._stats["misses"] += 1
         ref = datetime.datetime.fromisoformat(ref_iso)
-        return self._resolve_uncached(text, ref)
+        return self._resolve_uncached(text, ref, prefer)
 
-    def resolve(self, text: str, ref: Optional[datetime.datetime] = None) -> Optional[dict]:
+    def resolve(self, text: str, ref: Optional[datetime.datetime] = None, prefer: str = "future") -> Optional[dict]:
+        """Résout une expression temporelle avec préférence past/future."""
         if ref is None:
             ref = datetime.datetime.now()
-        result = self._cached_resolve(text.lower(), ref.isoformat())
+        result = self._cached_resolve(text.lower(), ref.isoformat(), prefer)
         if result:
             self._stats["hits"] += 1
         return result
 
-    def _resolve_uncached(self, text: str, ref: datetime.datetime) -> Optional[dict]:
+    def _resolve_uncached(self, text: str, ref: datetime.datetime, prefer: str = "future") -> Optional[dict]:
         year = ref.year
         for fn in (
             lambda: self._moment(text, ref),
@@ -2046,7 +648,7 @@ class FrenchTemporalResolver:
             lambda: self._weekday(text, ref),
             lambda: self._relative_day(text, ref),
             lambda: self._duration(text),
-            lambda: self._fallback_dateparser(text, ref),
+            lambda: self._fallback_dateparser(text, ref, prefer),
         ):
             r = fn()
             if r:
@@ -2057,8 +659,10 @@ class FrenchTemporalResolver:
         for name, patterns in self.MOMENT_PATTERNS.items():
             if not any(p in text for p in patterns):
                 continue
-            offset = (-2 if "avant-hier" in text else -1 if "hier" in text else
-                      2 if "après-demain" in text else 1 if "demain" in text else 0)
+            offset = (-2 if "avant-hier" in text else
+                      -1 if "hier" in text else
+                      2 if "après-demain" in text else
+                      1 if "demain" in text else 0)
             base = ref + datetime.timedelta(days=offset)
             sh, eh, mtype = self.MOMENTS[name]
             named = {"name": name, "type": "moment_of_day", "day_offset": offset}
@@ -2192,7 +796,7 @@ class FrenchTemporalResolver:
                         "named_event": {"type": "duration", "unit": unit}}
         return None
 
-    def _fallback_dateparser(self, text: str, ref: datetime.datetime) -> Optional[dict]:
+    def _fallback_dateparser(self, text: str, ref: datetime.datetime, prefer: str = "future") -> Optional[dict]:
         if not DATEPARSER_AVAILABLE:
             return None
         dp = _get_dateparser()
@@ -2200,7 +804,8 @@ class FrenchTemporalResolver:
             dt = dp.parse(text, languages=[LANGUAGE],
                           settings={"RELATIVE_BASE": ref,
                                     "RETURN_AS_TIMEZONE_AWARE": True,
-                                    "TIMEZONE": "Europe/Paris"})
+                                    "TIMEZONE": "Europe/Paris",
+                                    "PREFER_DATES_FROM": prefer})
             if dt:
                 iso = dt.isoformat()
                 return {"raw": text, "timex_type": "DATE",
@@ -2233,14 +838,413 @@ class FrenchTemporalResolver:
         }
 
 
-def _extract_all_slots(doc):
-    who_person = None
-    who_raw = None
-    with_who_set = set()
-    where = None
-    entities = []
-    seen_spans = set()
-    subjects = set()
+_temporal_resolver: Optional[FrenchTemporalResolver] = None
+
+
+def _get_temporal_resolver() -> FrenchTemporalResolver:
+    global _temporal_resolver
+    if _temporal_resolver is None:
+        _temporal_resolver = FrenchTemporalResolver()
+    return _temporal_resolver
+
+
+# ============================================================
+# SECTION 5 — ConversationContext (v6) + ConversationFrame (v3)
+# ============================================================
+
+@dataclass
+class ConversationContext:
+    """Résolution des ellipses et pronoms anaphoriques."""
+    last_intent_type: Optional[IntentType] = None
+    last_verb_lemma: Optional[str] = None
+    last_actor: Optional[str] = None
+    last_action: Optional[str] = None
+    last_location: Optional[str] = None
+    last_when_iso: Optional[str] = None
+    timestamp: float = field(default_factory=time.time)
+
+    def is_expired(self) -> bool:
+        return time.time() - self.timestamp > CONTEXT_RESET_SEC
+
+    def update_from_intent(self, intent: "Intent"):
+        self.last_intent_type = intent.intent
+        self.last_verb_lemma = intent.verb.lemma if intent.verb else None
+        self.last_actor = intent.who_raw
+        self.last_action = intent.action or (intent.verb.lemma if intent.verb else None)
+        self.last_location = intent.where
+        self.last_when_iso = intent.when.iso_start if intent.when else None
+        self.timestamp = time.time()
+
+    def resolve_ellipsis(self, text: str) -> str:
+        if self.is_expired():
+            return text
+        tl = text.lower().strip()
+        if tl in ("oui", "ouais", "ok", "d'accord", "okay", "bien sûr"):
+            if self.last_intent_type == "query_narrative" and self.last_verb_lemma:
+                return f"oui, {self.last_verb_lemma}"
+        if tl in ("encore", "recommence", "refais", "re"):
+            if self.last_action:
+                return f"refais {self.last_action}"
+        return text
+
+    def resolve_pronouns(self, text: str) -> str:
+        if self.is_expired():
+            return text
+        result = text
+        if re.search(r'\by\b', result) and self.last_location:
+            result = re.sub(r'\by\b', self.last_location, result)
+        if re.search(r'\ben\b', result) and self.last_action:
+            result = re.sub(r'\ben\b', f"de {self.last_action}", result)
+        return result
+
+
+@dataclass
+class ConversationFrame:
+    """Héritage de slots (who/when/where) entre fragments."""
+    who: Optional[PersonType] = None
+    who_raw: Optional[str] = None
+    with_who: List[str] = field(default_factory=list)
+    when: Optional[TemporalSpan] = None
+    where: Optional[str] = None
+    what: Optional[ConceptType] = None
+    last_update: float = field(default_factory=time.monotonic)
+    pending_fragments: List[str] = field(default_factory=list)
+    subjects: List[str] = field(default_factory=list)
+    durations: List[dict] = field(default_factory=list)
+    register: Optional[str] = None
+
+    def is_expired(self) -> bool:
+        return time.monotonic() - self.last_update > CONTEXT_RESET_SEC
+
+    def reset(self):
+        self.who = self.who_raw = self.when = self.where = self.what = self.register = None
+        self.with_who = []
+        self.pending_fragments = []
+        self.subjects = []
+        self.durations = []
+        self.last_update = time.monotonic()
+
+    def update(self, **kwargs):
+        for k, v in kwargs.items():
+            if not hasattr(self, k) or v is None:
+                continue
+            if k == "with_who":
+                self.with_who = list(set(self.with_who + v))
+            elif k == "fragment":
+                self.pending_fragments.append(v)
+            else:
+                setattr(self, k, v)
+        self.last_update = time.monotonic()
+
+    def flush_pending(self) -> List[str]:
+        frags, self.pending_fragments = list(self.pending_fragments), []
+        return frags
+
+
+# ============================================================
+# SECTION 6 — Structures de données
+# ============================================================
+
+@dataclass
+class VerbAnalysis:
+    lemma: str
+    tense: TenseType
+    scope: ScopeType
+    concept: Optional[ConceptType]
+    person: PersonType = "unknown"
+    number: str = "unknown"
+    mood: MoodType = "indicative"
+    polarity: PolarityType = "positive"
+    modal: ModalType = None
+    pronominal: bool = False
+    impersonal: bool = False
+    compound: bool = False
+
+
+@dataclass
+class RegisterAnalysis:
+    language: str = "fr"
+    style: str = "neutre"
+    confidence: float = 0.5
+    markers: List[str] = field(default_factory=list)
+    tu_vous: str = "indéterminé"
+    negation: str = "absente"
+
+
+@dataclass
+class TokenNode:
+    text: str
+    lemma: str
+    pos: str
+    dep: str
+    token_index: int
+    role: Optional[RoleType] = None
+    children: List["TokenNode"] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {"text": self.text, "lemma": self.lemma, "pos": self.pos,
+                "dep": self.dep, "role": self.role,
+                "children": [c.to_dict() for c in self.children]}
+
+
+@dataclass
+class SyntacticTree:
+    phrase: str
+    root: Optional[TokenNode] = None
+    subject: Optional[str] = None
+    subject_role: Optional[RoleType] = None
+    object_: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {"phrase": self.phrase,
+                "root": self.root.to_dict() if self.root else None,
+                "subject": self.subject, "subject_role": self.subject_role,
+                "object": self.object_}
+
+
+@dataclass
+class Intent:
+    text: str
+    intent: IntentType
+    confidence: float
+    uncertain: bool
+    scores: dict
+    verb: Optional[VerbAnalysis]
+    who: Optional[PersonType]
+    who_raw: Optional[str]
+    with_who: List[str]
+    when: Optional[TemporalSpan]
+    where: Optional[str]
+    what: Optional[ConceptType]
+    action: Optional[str]
+    target: Optional[str]
+    actions: List[dict]
+    entities: List[dict]
+    memory_hint: Optional[dict]
+    register: Optional[dict]
+    assembled_from: List[str]
+    syntax_tree: Optional[SyntacticTree] = None
+    corrections: List[Tuple[str, str]] = field(default_factory=list)
+    clause_index: int = 0
+    processing_ms: float = 0.0
+    ts: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    def to_cognitive_frame(self) -> dict:
+        return {
+            "type": "intent",
+            "intent_type": self.intent,
+            "verb": self.verb.lemma if self.verb else None,
+            "concept": self.verb.concept if self.verb else None,
+            "scope": self.verb.scope if self.verb else "UNKNOWN",
+            "modal": self.verb.modal if self.verb else None,
+            "polarity": self.verb.polarity if self.verb else "positive",
+            "who": self.who,
+            "who_raw": self.who_raw,
+            "with_who": self.with_who,
+            "time_start": self.when.iso_start if self.when else None,
+            "time_end": self.when.iso_end if self.when else None,
+            "time_event": self.when.named_event if self.when else None,
+            "location": self.where,
+            "action": self.action,
+            "target": self.target,
+            "confidence": self.confidence,
+            "processing_ms": self.processing_ms,
+        }
+
+
+# ============================================================
+# SECTION 7 — PipelineMetrics
+# ============================================================
+
+class PipelineMetrics:
+    def __init__(self):
+        self.total = 0
+        self.total_ms = 0.0
+        self.errors = 0
+        self.intent_dist: Dict[str, int] = defaultdict(int)
+        self.corrections: Dict[str, int] = defaultdict(int)
+        self.start_time = time.time()
+
+    def record(self, intent: Intent):
+        self.total += 1
+        self.total_ms += intent.processing_ms
+        self.intent_dist[intent.intent] += 1
+        for orig, _ in intent.corrections:
+            self.corrections[orig] += 1
+
+    def record_error(self):
+        self.errors += 1
+
+    def summary(self) -> dict:
+        avg = self.total_ms / self.total if self.total else 0
+        return {
+            "total_requests": self.total,
+            "total_errors": self.errors,
+            "avg_ms": round(avg, 1),
+            "intent_distribution": dict(self.intent_dist),
+            "top_corrections": sorted(self.corrections.items(),
+                                      key=lambda x: x[1], reverse=True)[:10],
+            "uptime_s": round(time.time() - self.start_time, 1),
+        }
+
+
+# ============================================================
+# SECTION 8 — IntentClassifier déterministe
+# ============================================================
+
+_CHIT_CHAT_WORDS = frozenset({
+    "bonjour", "salut", "coucou", "bonsoir", "bye",
+    "merci", "svp", "bravo", "félicitations", "chapeau", "super", "génial",
+})
+
+_CHIT_CHAT_PHRASES = (
+    "bonne nuit", "au revoir", "s'il vous plaît", "s'il te plaît",
+    "ça va", "comment vas", "comment allez",
+)
+
+_INTERROGATIVE_WORDS = frozenset({
+    "quel", "quelle", "quels", "quelles", "quoi", "comment",
+    "pourquoi", "quand", "où", "qui", "combien", "lequel", "laquelle",
+    "lesquels", "lesquelles", "est-ce", "est ce",
+})
+
+_ACTION_DEVICE_WORDS = frozenset({
+    "allume", "allumer", "éteins", "éteindre", "ouvre", "ouvrir",
+    "ferme", "fermer", "active", "activer", "désactive", "désactiver",
+    "monte", "monter", "baisse", "baisser", "règle", "régler",
+    "mets", "mettre", "configure", "configurer", "programme", "programmer",
+    "démarre", "démarrer", "stoppe", "stopper", "coupe", "couper",
+})
+
+
+def _clf(intent: IntentType, confidence: float) -> dict:
+    return {
+        "intent": intent,
+        "confidence": round(confidence, 3),
+        "uncertain": confidence < CONFIDENCE_THRESHOLD,
+        "scores": {intent: round(confidence, 3)},
+    }
+
+
+def classify_intent(verb: Optional[VerbAnalysis], doc, text: str) -> dict:
+    tl = text.lower().strip()
+    words = set(tl.split())
+
+    if verb and verb.mood == "imperative":
+        if (verb.lemma in ACTION_VERBS
+                or words & _ACTION_DEVICE_WORDS
+                or any(noun in tl for noun in DEVICE_NOUNS)):
+            return _clf("action_device", 0.95)
+        return _clf("action_device", 0.80)
+
+    if (words & _ACTION_DEVICE_WORDS
+            and any(noun in tl for noun in DEVICE_NOUNS)):
+        return _clf("action_device", 0.88)
+
+    if words & _CHIT_CHAT_WORDS or any(p in tl for p in _CHIT_CHAT_PHRASES):
+        return _clf("chit_chat", 0.93)
+
+    if (verb and verb.concept == "SOCIAL_ACT"
+            and len(tl.split()) <= 7):
+        return _clf("chit_chat", 0.88)
+
+    has_question_mark = "?" in text
+    has_interrogative = bool(words & _INTERROGATIVE_WORDS)
+
+    if has_question_mark or has_interrogative:
+        scope = verb.scope if verb else "UNKNOWN"
+
+        if scope == "PAST":
+            return _clf("query_narrative", 0.90)
+
+        if scope == "FUTURE":
+            return _clf("query_intention", 0.88)
+
+        if verb and verb.tense == "past":
+            return _clf("query_narrative", 0.85)
+
+        return _clf("query_state", 0.85)
+
+    if verb and verb.person in ("1st_sg", "1st_pl"):
+        return _clf("information_input", 0.88)
+
+    if verb and verb.tense in ("past", "present", "future"):
+        return _clf("information_input", 0.78)
+
+    return _clf("chit_chat", 0.55)
+
+
+class IntentClassifier:
+    def classify(self, text: str, verb: Optional[VerbAnalysis] = None, doc=None) -> dict:
+        return classify_intent(verb, doc, text)
+
+    def load(self):
+        logger.info("IntentClassifier déterministe prêt (sans modèle).")
+
+
+# ============================================================
+# SECTION 9 — SyntacticTreeExtractor
+# ============================================================
+
+class SyntacticTreeExtractor:
+    _USER = {"je", "j'", "moi", "me", "m'"}
+    _ASE = {"tu", "toi", "te", "t'"}
+
+    @classmethod
+    def _role(cls, token) -> Optional[RoleType]:
+        tl = token.text.lower()
+        if tl in cls._USER:
+            return "user"
+        if tl in cls._ASE:
+            return "ase"
+        if token.ent_type_ == "PER":
+            return "other"
+        return None
+
+    @classmethod
+    def extract(cls, doc) -> SyntacticTree:
+        tree = SyntacticTree(phrase=doc.text)
+        nodes: Dict[int, TokenNode] = {}
+
+        for token in doc:
+            node = TokenNode(
+                text=token.text, lemma=token.lemma_,
+                pos=token.pos_, dep=token.dep_,
+                token_index=token.i, role=cls._role(token),
+            )
+            nodes[token.i] = node
+            if token.dep_ == "ROOT":
+                tree.root = node
+            if token.dep_ in ("nsubj", "nsubj:pass"):
+                tree.subject = token.text
+                tree.subject_role = node.role
+            if token.dep_ == "obj" and tree.object_ is None:
+                tree.object_ = token.text
+
+        for token in doc:
+            if token.head != token and token.head.i in nodes:
+                nodes[token.head.i].children.append(nodes[token.i])
+
+        return tree
+
+
+# ============================================================
+# SECTION 10 — Extracteurs spaCy (1 passe)
+# ============================================================
+
+def _extract_all_slots(
+    doc,
+) -> Tuple[Optional[PersonType], Optional[str], List[str], Optional[str], List[dict]]:
+    who_person: Optional[PersonType] = None
+    who_raw: Optional[str] = None
+    with_who_set: set = set()
+    where: Optional[str] = None
+    entities: List[dict] = []
+    seen_spans: set = set()
+    subjects: set = set()
 
     for ent in doc.ents:
         etype = NER_TYPE_MAP.get(ent.label_)
@@ -2251,11 +1255,12 @@ def _extract_all_slots(doc):
             continue
         seen_spans.add(key)
         raw = ent.text.strip()
-        value = None
-        unit = None
+        value: Optional[float] = None
+        unit: Optional[str] = None
         if etype in ("number", "ordinal", "quantity", "percent", "money",
                      "time_ref", "date_ref", "duration"):
-            nm = re.search(r"(\d+(?:[.,]\d+)?)", raw.replace("\u202f", "").replace(" ", ""))
+            nm = re.search(r"(\d+(?:[.,]\d+)?)",
+                           raw.replace("\u202f", "").replace(" ", ""))
             if nm:
                 try:
                     value = float(nm.group(1).replace(",", "."))
@@ -2304,7 +1309,8 @@ def _extract_all_slots(doc):
                 who_person, who_raw = token.text, token.text
             subjects.add(token.text)
 
-        if not where and token.text.lower() in ("dans", "au", "en", "à", "chez") and token.dep_ == "case":
+        if not where and token.text.lower() in ("dans", "au", "en", "à", "chez") \
+                and token.dep_ == "case":
             head = token.head
             if head.pos_ in ("NOUN", "PROPN"):
                 where = head.text.lower()
@@ -2328,7 +1334,8 @@ def _extract_verb(doc) -> Optional[VerbAnalysis]:
         if token.dep_ not in ("ROOT", "acl", "relcl", "advcl", "xcomp", "ccomp"):
             continue
         morph = token.morph
-        mood_map = {"Cnd": "conditional", "Imp": "imperative", "Sub": "subjunctive", "Ind": "indicative"}
+        mood_map = {"Cnd": "conditional", "Imp": "imperative",
+                    "Sub": "subjunctive", "Ind": "indicative"}
         mood_raw = morph.get("Mood")
         mood: MoodType = "indicative"
         if mood_raw:
@@ -2369,7 +1376,8 @@ def _extract_verb(doc) -> Optional[VerbAnalysis]:
             person = pm.get((person_raw[0], number_raw[0]), "unknown")
             number = "sg" if number_raw[0] == "Sing" else "pl" if number_raw[0] == "Plur" else "unknown"
 
-        neg = [c for c in token.children if c.dep_ == "advmod" and c.lemma_ in ("ne", "pas", "plus", "jamais", "rien", "guère")]
+        neg = [c for c in token.children
+               if c.dep_ == "advmod" and c.lemma_ in ("ne", "pas", "plus", "jamais", "rien", "guère")]
         left_neg = any(t.dep_ == "advmod" and t.lemma_ in ("ne", "n") for t in token.lefts)
         polarity: PolarityType = "negative" if (neg or left_neg) else "positive"
 
@@ -2479,56 +1487,52 @@ def _infer_info_subject(doc) -> str:
 
 
 def _is_fragment(doc, slots: dict) -> bool:
-    has_verb = any(t.pos_ == "VERB" and t.dep_ in ("ROOT", "acl", "relcl", "advcl", "xcomp", "ccomp") for t in doc)
-    return not has_verb and any([slots.get("who"), slots.get("when"), slots.get("where"), slots.get("with_who")])
+    has_verb = any(
+        t.pos_ == "VERB" and t.dep_ in ("ROOT", "acl", "relcl", "advcl", "xcomp", "ccomp")
+        for t in doc
+    )
+    return not has_verb and any([
+        slots.get("who"), slots.get("when"), slots.get("where"), slots.get("with_who"),
+    ])
 
 
 def _analyze_register(doc, text: str) -> RegisterAnalysis:
     toks = [t.text.lower().rstrip("'") for t in doc]
-    votes = {s: 0.0 for s in REGISTER_LEXICON}
-    marks = {s: [] for s in REGISTER_LEXICON}
-
-    politeness = any(p in text.lower() for p in ("stp", "svp", "s'il te plaît", "s'il vous plaît", "merci de"))
-
+    votes: Dict[str, float] = {s: 0.0 for s in REGISTER_LEXICON}
+    marks: Dict[str, list] = {s: [] for s in REGISTER_LEXICON}
     for tok in toks:
         for style, lex in REGISTER_LEXICON.items():
             if tok in lex:
                 votes[style] += 1
                 marks[style].append(tok)
-
     has_pas = any(w in toks for w in ("pas", "plus", "jamais"))
     has_ne = any(t in toks for t in NEGATION_COMPLETE)
     if has_pas and not has_ne:
         votes["familier"] += 1
         marks["familier"].append("neg-inc")
-
     tu_vous = "indéterminé"
     if any(t in VOUVOIEMENT_MARKERS for t in toks) and not any(t in TUTOIEMENT_MARKERS for t in toks):
         tu_vous = "vous"
         votes["soutenu"] += 0.5
     elif any(t in TUTOIEMENT_MARKERS for t in toks):
         tu_vous = "tu"
-
     best = max(votes, key=votes.get)
     conf = round(min(0.95, sum(votes.values()) / max(len(toks), 1)), 3)
     if votes[best] < 0.8:
         best = "neutre"
-
     all_markers = marks.get(best, [])
     if tu_vous != "indéterminé":
         all_markers.append(f"tutv:{tu_vous}")
-    if politeness:
-        all_markers.append("polite")
-
     neg = ("complete" if has_pas and has_ne else "incomplete" if has_pas else "absente")
-    return RegisterAnalysis(style=best, confidence=conf, markers=all_markers[:8], tu_vous=tu_vous, negation=neg, politeness=politeness)
+    return RegisterAnalysis(style=best, confidence=conf,
+                            markers=all_markers[:8], tu_vous=tu_vous, negation=neg)
 
 
 def split_clauses(text: str) -> List[str]:
     parts = _CLAUSE_COORD.split(text)
     if len(parts) == 1:
         return [text.strip()]
-    valid = []
+    valid: List[str] = []
     for part in parts:
         part = part.strip()
         if not part:
@@ -2543,22 +1547,15 @@ def split_clauses(text: str) -> List[str]:
     return valid if len(valid) >= 2 else [text.strip()]
 
 
-_CLAUSE_COORD = re.compile(
-    r'\s+(?:et|puis|ensuite|après|alors)\s+'
-    r'(?=je\s|j\'|tu\s|il\s|elle\s|nous\s|vous\s|ils\s|elles\s|on\s)',
-    re.IGNORECASE,
-)
+# ============================================================
+# SECTION 11 — Extraction temporelle
+# ============================================================
 
-_VERB_PAT = re.compile(
-    r"\b(suis|es|est|sommes|êtes|sont|ai|as|a|avons|avez|ont|"
-    r"vais|vas|va|allons|allez|vont|ferai|feras|fera|"
-    r"\w+erai|\w+eras|\w+era|\w+erons|\w+erez|\w+eront|"
-    r"\w+ais|\w+ait|\w+ions|\w+iez|\w+aient)\b",
-    re.IGNORECASE,
-)
-
-
-def _extract_temporal_v4(doc, tense: str = "unknown", resolver=None) -> Optional[TemporalSpan]:
+def _extract_temporal_v4(
+    doc,
+    tense: str = "unknown",
+    resolver: Optional[FrenchTemporalResolver] = None,
+) -> Optional[TemporalSpan]:
     resolver = resolver or _get_temporal_resolver()
     prefer = "future" if tense in ("future", "conditional") else "past"
     dp = _get_dateparser() if DATEPARSER_AVAILABLE else None
@@ -2568,7 +1565,8 @@ def _extract_temporal_v4(doc, tense: str = "unknown", resolver=None) -> Optional
         return interval
 
     ref = datetime.datetime.now()
-    resolved = resolver.resolve(doc.text, ref)
+    # CORRECTION: passer prefer au resolver
+    resolved = resolver.resolve(doc.text, ref, prefer=prefer)
     if resolved and resolved.get("source", "none") not in ("none", ""):
         span = resolver.to_temporal_span(resolved, tense)
         if span:
@@ -2592,7 +1590,8 @@ def _extract_temporal_v4(doc, tense: str = "unknown", resolver=None) -> Optional
                 if dt:
                     iso = dt.isoformat()
                     return TemporalSpan(raw=ent.text, iso_start=iso, iso_end=iso,
-                                        timex_type=TIMEX3.get(ttype, "DATE"), source="timexy")
+                                        timex_type=TIMEX3.get(ttype, "DATE"),
+                                        source="timexy")
 
     if dp:
         cfg = {"RETURN_AS_TIMEZONE_AWARE": True, "TIMEZONE": "Europe/Paris", "PREFER_DATES_FROM": prefer}
@@ -2650,8 +1649,10 @@ def _parse_durations(text: str) -> List[dict]:
     ):
         val = float(m.group(1).replace(",", "."))
         u_raw = m.group(2).lower()
-        unit = ("h" if u_raw.startswith("h") else "min" if u_raw.startswith("min") else
-                "s" if u_raw.startswith("s") else "day" if u_raw.startswith("j") else
+        unit = ("h" if u_raw.startswith("h") else
+                "min" if u_raw.startswith("min") else
+                "s" if u_raw.startswith("s") else
+                "day" if u_raw.startswith("j") else
                 "week" if u_raw.startswith("sem") else "month")
         results.append({"type": "duration", "value": val, "unit": unit, "raw": m.group(0)})
     if DATEPARSER_AVAILABLE:
@@ -2676,7 +1677,7 @@ def _merge_time_duration(span: TemporalSpan, durations: List[dict]) -> TemporalS
         return span
     end_dt = start_dt
     dur_raw = dur_unit = until_raw = None
-    dur_val = None
+    dur_val: Optional[float] = None
     for d in durations:
         if d["type"] == "until":
             try:
@@ -2702,168 +1703,130 @@ def _merge_time_duration(span: TemporalSpan, durations: List[dict]) -> TemporalS
                    duration_value=dur_val, until_raw=until_raw)
 
 
-_CHIT_CHAT_WORDS = frozenset({
-    "bonjour", "salut", "coucou", "bonsoir", "bye", "merci", "svp", "bravo",
-    "félicitations", "chapeau", "super", "génial",
-})
+# ============================================================
+# SECTION 12 — Entraînement CamemBERT (optionnel)
+# ============================================================
 
-_CHIT_CHAT_PHRASES = (
-    "bonne nuit", "au revoir", "s'il vous plaît", "s'il te plaît",
-    "ça va", "comment vas", "comment allez",
-)
-
-_INTERROGATIVE_WORDS = frozenset({
-    "quel", "quelle", "quels", "quelles", "quoi", "comment", "pourquoi",
-    "quand", "où", "qui", "combien", "lequel", "laquelle", "lesquels", "lesquelles",
-    "est-ce", "est ce",
-})
-
-_ACTION_DEVICE_WORDS = frozenset({
-    "allume", "allumer", "éteins", "éteindre", "ouvre", "ouvrir", "ferme", "fermer",
-    "active", "activer", "désactive", "désactiver", "monte", "monter", "baisse", "baisser",
-    "règle", "régler", "mets", "mettre", "configure", "configurer", "programme", "programmer",
-    "démarre", "démarrer", "stoppe", "stopper", "coupe", "couper",
-})
+def download_model():
+    from transformers import CamembertTokenizer, CamembertForSequenceClassification
+    logger.info(f"Téléchargement de '{MODEL_NAME}'…")
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    CamembertTokenizer.from_pretrained(MODEL_NAME).save_pretrained(MODEL_DIR / "tokenizer")
+    CamembertForSequenceClassification.from_pretrained(
+        MODEL_NAME, num_labels=len(INTENTS), ignore_mismatched_sizes=True
+    ).save_pretrained(MODEL_DIR / "base")
+    logger.info(f"Sauvegardé → {MODEL_DIR}")
 
 
-def _clf(intent: IntentType, confidence: float) -> dict:
-    return {"intent": intent, "confidence": round(confidence, 3),
-            "uncertain": confidence < CONFIDENCE_THRESHOLD, "scores": {intent: round(confidence, 3)}}
+def train(data_file: Path = DATA_FILE):
+    import torch
+    from torch.utils.data import DataLoader, random_split
+    from torch.optim import AdamW
+    from transformers import (CamembertTokenizer, CamembertForSequenceClassification,
+                              get_linear_schedule_with_warmup)
+    from sklearn.metrics import classification_report
+
+    with open(data_file, encoding="utf-8") as f:
+        data = json.load(f)
+
+    label2id = {intent: i for i, intent in enumerate(INTENTS)}
+    id2label = {i: intent for intent, i in label2id.items()}
+    texts = [d["text"] for d in data]
+    labels = [label2id[d["intent"]] for d in data]
+
+    tok_path = MODEL_DIR / "tokenizer"
+    if not tok_path.exists():
+        raise FileNotFoundError("Tokenizer absent — lance --download d'abord.")
+
+    tokenizer = CamembertTokenizer.from_pretrained(str(tok_path))
+
+    class _DS:
+        def __init__(self, texts, labels):
+            self.enc = tokenizer(texts, truncation=True, padding=True,
+                                 max_length=MAX_LENGTH, return_tensors="pt")
+            self.labels = labels
+
+        def __len__(self):
+            return len(self.labels)
+
+        def __getitem__(self, i):
+            item = {k: v[i] for k, v in self.enc.items()}
+            item["labels"] = torch.tensor(self.labels[i], dtype=torch.long)
+            return item
+
+    ds = _DS(texts, labels)
+    val_n = int(len(ds) * TEST_SPLIT)
+    train_ds, val_ds = random_split(ds, [len(ds) - val_n, val_n],
+                                    generator=torch.Generator().manual_seed(42))
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE)
+
+    device = torch.device("cpu")
+    model = CamembertForSequenceClassification.from_pretrained(
+        str(MODEL_DIR / "base"), num_labels=len(INTENTS),
+        id2label=id2label, label2id=label2id,
+        ignore_mismatched_sizes=True).to(device)
+    optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(len(train_loader) * EPOCHS * WARMUP_RATIO),
+        num_training_steps=len(train_loader) * EPOCHS)
+
+    best_acc = 0.0
+    no_improve = 0
+    fdir = MODEL_DIR / "finetuned"
+
+    for epoch in range(1, EPOCHS + 1):
+        model.train()
+        total_loss = 0.0
+        t0 = time.time()
+        for batch in train_loader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            loss = model(**batch).loss
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+            total_loss += loss.item()
+        model.eval()
+        preds, true = [], []
+        with torch.no_grad():
+            for batch in val_loader:
+                batch = {k: v.to(device) for k, v in batch.items()}
+                preds.extend(torch.argmax(model(**batch).logits, dim=1).cpu().numpy())
+                true.extend(batch["labels"].cpu().numpy())
+        acc = np.mean(np.array(preds) == np.array(true))
+        logger.info(f"Epoch {epoch}/{EPOCHS} | loss={total_loss / len(train_loader):.4f} "
+                    f"| val_acc={acc:.3f} | {time.time() - t0:.1f}s")
+        if acc > best_acc:
+            best_acc = acc
+            no_improve = 0
+            model.save_pretrained(str(fdir))
+            tokenizer.save_pretrained(str(fdir))
+            with open(fdir / "label_map.json", "w") as f:
+                json.dump({"id2label": id2label, "label2id": label2id}, f)
+            logger.info(f"  ✓ Meilleur modèle (val_acc={acc:.3f})")
+        else:
+            no_improve += 1
+            if no_improve >= EARLY_STOPPING_PATIENCE:
+                logger.info(f"Early stopping à l'époque {epoch}.")
+                break
+
+    model_best = CamembertForSequenceClassification.from_pretrained(str(fdir)).to(device)
+    model_best.eval()
+    preds, true = [], []
+    with torch.no_grad():
+        for batch in DataLoader(val_ds, batch_size=BATCH_SIZE):
+            batch = {k: v.to(device) for k, v in batch.items()}
+            preds.extend(torch.argmax(model_best(**batch).logits, dim=1).cpu().numpy())
+            true.extend(batch["labels"].cpu().numpy())
+    print(classification_report(true, preds, target_names=INTENTS, digits=3))
 
 
-def classify_intent(verb: Optional[VerbAnalysis], doc, text: str) -> dict:
-    tl = text.lower().strip()
-    words = set(tl.split())
-
-    if verb and verb.mood == "imperative":
-        if (verb.lemma in ACTION_VERBS or words & _ACTION_DEVICE_WORDS or
-                any(noun in tl for noun in DEVICE_NOUNS)):
-            return _clf("action_device", 0.95)
-        return _clf("action_device", 0.80)
-
-    if (words & _ACTION_DEVICE_WORDS and any(noun in tl for noun in DEVICE_NOUNS)):
-        return _clf("action_device", 0.88)
-
-    if words & _CHIT_CHAT_WORDS or any(p in tl for p in _CHIT_CHAT_PHRASES):
-        return _clf("chit_chat", 0.93)
-
-    if (verb and verb.concept == "SOCIAL_ACT" and len(tl.split()) <= 7):
-        return _clf("chit_chat", 0.88)
-
-    has_question_mark = "?" in text
-    has_interrogative = bool(words & _INTERROGATIVE_WORDS)
-
-    if has_question_mark or has_interrogative:
-        scope = verb.scope if verb else "UNKNOWN"
-        if scope == "PAST":
-            return _clf("query_narrative", 0.90)
-        if scope == "FUTURE":
-            return _clf("query_intention", 0.88)
-        if verb and verb.tense == "past":
-            return _clf("query_narrative", 0.85)
-        return _clf("query_state", 0.85)
-
-    if verb and verb.person in ("1st_sg", "1st_pl"):
-        return _clf("information_input", 0.88)
-
-    if verb and verb.tense in ("past", "present", "future"):
-        return _clf("information_input", 0.78)
-
-    return _clf("chit_chat", 0.55)
-
-
-class IntentClassifier:
-    def classify(self, text: str, verb: Optional[VerbAnalysis] = None, doc=None) -> dict:
-        return classify_intent(verb, doc, text)
-
-    def load(self):
-        logger.info("IntentClassifier déterministe prêt (sans modèle).")
-
-
-class SyntacticTreeExtractor:
-    _USER = {"je", "j'", "moi", "me", "m'"}
-    _ASE = {"tu", "toi", "te", "t'"}
-
-    @classmethod
-    def _role(cls, token) -> Optional[RoleType]:
-        tl = token.text.lower()
-        if tl in cls._USER:
-            return "user"
-        if tl in cls._ASE:
-            return "ase"
-        if token.ent_type_ == "PER":
-            return "other"
-        return None
-
-    @classmethod
-    def extract(cls, doc) -> SyntacticTree:
-        tree = SyntacticTree(phrase=doc.text)
-        nodes = {}
-        for token in doc:
-            node = TokenNode(
-                text=token.text, lemma=token.lemma_, pos=token.pos_, dep=token.dep_,
-                token_index=token.i, role=cls._role(token),
-            )
-            nodes[token.i] = node
-            if token.dep_ == "ROOT":
-                tree.root = node
-            if token.dep_ in ("nsubj", "nsubj:pass"):
-                tree.subject = token.text
-                tree.subject_role = node.role
-            if token.dep_ == "obj" and tree.object_ is None:
-                tree.object_ = token.text
-        for token in doc:
-            if token.head != token and token.head.i in nodes:
-                nodes[token.head.i].children.append(nodes[token.i])
-        return tree
-
-
-@dataclass
-class TokenNode:
-    text: str
-    lemma: str
-    pos: str
-    dep: str
-    token_index: int
-    role: Optional[RoleType] = None
-    children: List["TokenNode"] = field(default_factory=list)
-
-    def to_dict(self) -> dict:
-        return {"text": self.text, "lemma": self.lemma, "pos": self.pos,
-                "dep": self.dep, "role": self.role,
-                "children": [c.to_dict() for c in self.children]}
-
-
-class PipelineMetrics:
-    def __init__(self):
-        self.total = 0
-        self.total_ms = 0.0
-        self.errors = 0
-        self.intent_dist = defaultdict(int)
-        self.corrections = defaultdict(int)
-        self.start_time = time.time()
-
-    def record(self, intent: Intent):
-        self.total += 1
-        self.total_ms += intent.processing_ms
-        self.intent_dist[intent.intent] += 1
-        for orig, _ in intent.corrections:
-            self.corrections[orig] += 1
-
-    def record_error(self):
-        self.errors += 1
-
-    def summary(self) -> dict:
-        avg = self.total_ms / self.total if self.total else 0
-        return {
-            "total_requests": self.total,
-            "total_errors": self.errors,
-            "avg_ms": round(avg, 1),
-            "intent_distribution": dict(self.intent_dist),
-            "top_corrections": sorted(self.corrections.items(), key=lambda x: x[1], reverse=True)[:10],
-            "uptime_s": round(time.time() - self.start_time, 1),
-        }
-
+# ============================================================
+# SECTION 13 — IntentPipeline v4 (sans batch)
+# ============================================================
 
 class IntentPipeline:
     def __init__(self, q_in: Queue, q_out: Queue, debug: bool = False):
@@ -2871,30 +1834,30 @@ class IntentPipeline:
         self._q_out = q_out
         self._debug = debug
         self._nlp = None
-        self._classifier = IntentClassifier()
+        self._classifier: Optional[IntentClassifier] = None
         self._resolver = FrenchTemporalResolver()
         self._ctx = ConversationContext()
         self._frame = ConversationFrame()
         self._metrics = PipelineMetrics()
-        self._thread = None
+        self._thread: Optional[threading.Thread] = None
         self._running = False
         self._loaded = False
         self._lock = threading.Lock()
         self._enable_corrector = True
-        self._corrections_stats = defaultdict(int)
+        self._corrections_stats: Dict[str, int] = defaultdict(int)
 
     def enable_corrector(self, enable: bool = True):
         self._enable_corrector = enable
 
     def load(self):
         self._load_spacy()
-        self._classifier.load()
+        self._load_classifier()
         self._loaded = True
-        logger.info("IntentPipeline v4.2 final prêt.")
+        logger.info("IntentPipeline v4 prêt.")
 
     def _load_spacy(self):
         if not SPACY_AVAILABLE:
-            raise ImportError("spacy requis")
+            raise ImportError("spacy requis : pip install spacy fr_core_news_sm")
         t0 = time.time()
         self._nlp = spacy.load(SPACY_MODEL)
         if _check_timexy():
@@ -2904,24 +1867,29 @@ class IntentPipeline:
                     self._nlp.add_pipe("timexy", config=cfg, last=True)
                 logger.info(f"spaCy + timexy chargés en {time.time() - t0:.2f}s")
             except Exception:
-                logger.info(f"spaCy chargé en {time.time() - t0:.2f}s")
+                logger.info(f"spaCy chargé en {time.time() - t0:.2f}s (timexy erreur)")
         else:
             logger.info(f"spaCy chargé en {time.time() - t0:.2f}s")
+
+    def _load_classifier(self):
+        self._classifier = IntentClassifier()
+        self._classifier.load()
 
     def start(self):
         if not self._loaded:
             raise RuntimeError("Appelle load() avant start().")
         self._running = True
-        self._thread = threading.Thread(target=self._worker, name="intent-pipeline-v4", daemon=True)
+        self._thread = threading.Thread(
+            target=self._worker, name="intent-pipeline-v4", daemon=True)
         self._thread.start()
-        logger.info("Pipeline démarré")
+        logger.info("IntentPipeline v4 démarré.")
 
     def stop(self):
         self._running = False
         self._q_in.put(None)
         if self._thread:
             self._thread.join(timeout=5.0)
-        logger.info("Pipeline arrêté")
+        logger.info("IntentPipeline v4 arrêté.")
 
     def _worker(self):
         while self._running:
@@ -2944,17 +1912,13 @@ class IntentPipeline:
                     self._ctx.update_from_intent(i)
 
     def _preprocess(self, text: str) -> Tuple[str, List[Tuple[str, str]]]:
-        text = EnhancedTokenizer.preprocess(text)
-        text, expansions = AliasExpander.expand(text)
         text = re.sub(r'[^\w\s\u00C0-\u00FF?.!,;:\'"()-]', '', text)
-
         if self._enable_corrector:
             corrected, corrections = FrenchTextCorrector.correct(text)
             for orig, fix in corrections:
                 self._corrections_stats[f"{orig}→{fix}"] += 1
-            return corrected, corrections + expansions
-
-        return text, expansions
+            return corrected, corrections
+        return text, []
 
     def _process(self, text: str) -> List[Intent]:
         if self._frame.is_expired():
@@ -2965,20 +1929,20 @@ class IntentPipeline:
         text = self._ctx.resolve_ellipsis(text)
         text = self._ctx.resolve_pronouns(text)
 
-        text_clean, expansions = self._preprocess(text)
-        doc = self._nlp(text_clean)
-        fixed_expr = AliasExpander.detect_fixed_expression(doc, text_clean)
-
+        text_clean, corrections = self._preprocess(text)
         clauses = split_clauses(text_clean)
 
         if len(clauses) == 1:
+            doc = self._nlp(text_clean)
             verb = _extract_verb(doc)
             who_p, who_r, with_who, where, _ = _extract_all_slots(doc)
-            temporal = _extract_temporal_v4(doc, verb.tense if verb else "unknown", self._resolver)
+            temporal = _extract_temporal_v4(doc, verb.tense if verb else "unknown",
+                                            self._resolver)
             slots = {"who": who_p, "who_raw": who_r, "with_who": with_who,
                      "where": where, "when": temporal, "what": _extract_what(doc)}
             if _is_fragment(doc, slots):
-                self._frame.update(fragment=text_clean, **{k: v for k, v in slots.items() if v is not None})
+                self._frame.update(fragment=text_clean,
+                                   **{k: v for k, v in slots.items() if v is not None})
                 logger.debug(f"Fragment accumulé : '{text_clean}'")
                 return []
 
@@ -2988,38 +1952,33 @@ class IntentPipeline:
             intent = self._process_clause(
                 clause, clause_index=idx,
                 assembled_from=assembled if idx == 0 else [],
-                corrections=expansions if idx == 0 else [],
-                fixed_expr=fixed_expr if idx == 0 else None,
+                corrections=corrections if idx == 0 else [],
             )
             if intent:
                 results.append(intent)
         return results
 
-    def _process_clause(self, text: str, clause_index: int = 0,
-                        assembled_from: List[str] = None, corrections: List[Tuple] = None,
-                        fixed_expr: Dict = None) -> Optional[Intent]:
+    def _process_clause(
+        self,
+        text: str,
+        clause_index: int = 0,
+        assembled_from: List[str] = None,
+        corrections: List[Tuple] = None,
+    ) -> Optional[Intent]:
         t0 = time.time()
         assembled_from = assembled_from or []
         corrections = corrections or []
 
         doc = self._nlp(text)
         verb = _extract_verb(doc)
-
-        if fixed_expr:
-            verb = VerbAnalysis(
-                lemma=fixed_expr["verb"],
-                tense=verb.tense if verb else "present",
-                scope=verb.scope if verb else "PRESENT",
-                concept=fixed_expr["concept"],
-                person=verb.person if verb else "unknown",
-                number=verb.number if verb else "unknown",
-                mood=verb.mood if verb else "indicative",
-                polarity=verb.polarity if verb else "positive",
-                modal=verb.modal if verb else None,
-                pronominal=fixed_expr.get("pronominal", False),
-            )
-
         tense = verb.tense if verb else "unknown"
+
+        if self._debug:
+            print(f"\n  [{clause_index}] '{text}'")
+            print(f"    verb={verb.lemma + '/' + verb.tense if verb else 'none'} "
+                  f"mood={verb.mood if verb else '?'} "
+                  f"modal={verb.modal if verb else '?'} "
+                  f"polarity={verb.polarity if verb else '?'}")
 
         syntax_tree = SyntacticTreeExtractor.extract(doc)
 
@@ -3027,111 +1986,16 @@ class IntentPipeline:
         temporal = _extract_temporal_v4(doc, tense, self._resolver)
         what = _extract_what(doc)
 
-        # Tous les extracteurs
-        relations = RelationExtractor.extract(doc)
-        triplets = [(r.subject, r.predicate, r.object) for r in relations if r.subject and r.object]
-        coreferences = CoreferenceExtractor.extract(doc)
-        attributes = AttributeExtractor.extract(doc)
-        events = EventExtractor.extract(doc)
-        subordinate_clauses = SubordinateClauseExtractor.extract(doc)
-        relative_tenses = RelativeTenseExtractor.extract(doc)
-        reported_speeches = ReportedSpeechExtractor.extract(doc)
-        contextual_roles = ContextualRoleExtractor.extract(doc)
-        collective_entities = CollectiveEntityExtractor.extract(doc)
-        enhanced_comparisons = EnhancedComparisonExtractor.extract(doc)
-        compound_modalities = CompoundModalityExtractor.extract(doc, verb) if verb else []
-
-        scheduled_time = None
-        if verb and verb.mood == "imperative":
-            scheduled_time = ScheduledTimeExtractor.extract(text)
-
-        quantifiers = []
-        for token in doc:
-            if token.text.lower() in ("tous", "toutes", "chaque", "aucun", "aucune", "quelques"):
-                for child in token.children:
-                    if child.pos_ in ("NOUN", "PROPN") and child.dep_ == "det":
-                        qtype = "universal" if token.text.lower() in ("tous", "chaque") else "existential"
-                        quantifiers.append(Quantifier(
-                            entity=child.text, quantifier=token.text.lower(),
-                            quantifier_type=qtype, confidence=0.85,
-                        ))
-
-        negations = []
-        for token in doc:
-            if token.lemma_ in ("ne", "pas", "plus", "jamais") and token.dep_ == "advmod":
-                for child in token.head.children:
-                    if child.dep_ in ("nsubj", "obj", "attr"):
-                        negations.append(Negation(
-                            negated_element=child.text, negation_word=token.text,
-                            scope=token.head.text, confidence=0.9,
-                        ))
-
-        comparisons = []
-        for token in doc:
-            if token.text.lower() in ("plus", "moins", "aussi"):
-                subject = None
-                attribute = None
-                object_ = None
-                for child in token.head.children:
-                    if child.dep_ in ("nsubj", "nsubj:pass"):
-                        subject = child.text
-                    if child.dep_ == "attr" and child.pos_ == "ADJ":
-                        attribute = child.text
-                for child in token.children:
-                    if child.text.lower() == "que":
-                        for grandchild in child.children:
-                            if grandchild.pos_ in ("NOUN", "PROPN"):
-                                object_ = grandchild.text
-                                break
-                if subject and attribute and object_:
-                    degree = "superiority" if token.text.lower() == "plus" else "inferiority" if token.text.lower() == "moins" else "equality"
-                    comparisons.append(Comparison(
-                        subject=subject, comparator=token.text.lower(),
-                        attribute=attribute, object=object_, degree=degree, confidence=0.85,
-                    ))
-        comparisons.extend(enhanced_comparisons)
-
-        roles = []
-        for token in doc:
-            if token.lemma_ in ("être", "devenir") and token.dep_ == "ROOT":
-                subject = None
-                role = None
-                context = None
-                for child in token.children:
-                    if child.dep_ in ("nsubj", "nsubj:pass"):
-                        subject = child.text
-                    if child.dep_ == "attr":
-                        role = child.text
-                        for grandchild in child.children:
-                            if grandchild.dep_ == "nmod":
-                                for gg in grandchild.children:
-                                    if gg.dep_ == "case":
-                                        context = gg.text
-                                    elif gg.pos_ in ("NOUN", "PROPN"):
-                                        context = f"{context or ''} {gg.text}" if context else gg.text
-                if subject and role:
-                    roles.append(Role(entity=subject, role=role, context=context, confidence=0.85))
-
-        primary_intent = classify_intent(verb, doc, text)["intent"]
-        secondary_intents = SecondaryIntentExtractor.extract(doc, primary_intent,
-                                                             scheduled_time.to_dict() if scheduled_time else None)
-
-        entities_set = set()
-        for ent in doc.ents:
-            if ent.label_ == "PER":
-                entities_set.add(ent.text)
-        for token in doc:
-            if token.pos_ == "NOUN" and token.dep_ == "nsubj":
-                entities_set.add(token.text)
+        if self._debug and temporal:
+            print(f"    when={temporal.raw} → {temporal.iso_start} "
+                  f"[{temporal.timex_type}/{temporal.source}]"
+                  + (f" event={temporal.named_event}" if temporal.named_event else ""))
 
         durations = _parse_durations(text) or self._frame.durations
         if temporal and durations:
             temporal = _merge_time_duration(temporal, durations)
         elif not temporal and self._frame.when and durations:
             temporal = _merge_time_duration(self._frame.when, durations)
-
-        if scheduled_time and temporal:
-            temporal.scheduled = scheduled_time
 
         actions = _extract_actions(doc)
         cur_subjects = [s for a in actions for s in a.get("subjects", [])]
@@ -3160,10 +2024,17 @@ class IntentPipeline:
             self._frame.update(register=reg.style)
 
         clf = self._classifier.classify(text, verb=verb, doc=doc)
-        action, target = _extract_device(doc) if clf["intent"] == "action_device" else (None, None)
+        action, target = None, None
+        if clf["intent"] == "action_device":
+            action, target = _extract_device(doc)
+
+        intent_type = clf["intent"]
+        if intent_type not in ("action_device",) and \
+           clf["confidence"] < 0.80 and _is_information_input(doc, verb):
+            intent_type = "information_input"
 
         memory_hint = None
-        if clf["intent"] == "information_input":
+        if intent_type == "information_input":
             memory_hint = {
                 "subject": _infer_info_subject(doc),
                 "salience": _compute_salience(doc, entities, verb),
@@ -3171,29 +2042,25 @@ class IntentPipeline:
                 "raw_info": text,
             }
 
-        processing_ms = (time.time() - t0) * 1000
+        ms = (time.time() - t0) * 1000
 
         if self._debug:
-            print(f"\n  [{clause_index}] '{text}'")
-            print(f"    verb={verb.lemma + '/' + verb.tense if verb else 'none'}")
-            print(f"    intent={clf['intent']} conf={clf['confidence']:.2f}")
-            print(f"    relations: {len(relations)}")
-            print(f"    coreferences: {len(coreferences)}")
-            print(f"    attributes: {len(attributes)}")
-            print(f"    events: {len(events)}")
-            print(f"    reported_speeches: {len(reported_speeches)}")
-            if scheduled_time:
-                print(f"    scheduled: {scheduled_time.human}")
+            print(f"    intent={intent_type} conf={clf['confidence']:.2f} "
+                  f"who={merged['who']}({merged['who_raw']}) "
+                  f"where={merged['where']} {ms:.0f}ms")
 
         logger.info(
-            f"  [{clause_index}] {clf['intent']} ({clf['confidence']:.2f}) "
+            f"  [{clause_index}] {intent_type} ({clf['confidence']:.2f}) "
             f"verb={verb.lemma + '/' + verb.tense if verb else 'none'} "
             f"who={merged['who']}({merged['who_raw']}) "
-            f"where={merged['where']} {processing_ms:.0f}ms"
+            f"where={merged['where']} "
+            f"when={merged['when'].raw if merged['when'] else None} "
+            f"{ms:.0f}ms"
+            + (f" ← {assembled_from}" if assembled_from else "")
         )
 
         return Intent(
-            text=text, intent=clf["intent"], confidence=clf["confidence"],
+            text=text, intent=intent_type, confidence=clf["confidence"],
             uncertain=clf["uncertain"], scores=clf["scores"],
             verb=verb, who=merged["who"], who_raw=merged["who_raw"],
             with_who=merged["with_who"], when=merged["when"],
@@ -3202,35 +2069,22 @@ class IntentPipeline:
             entities=entities, memory_hint=memory_hint,
             register=asdict(reg), assembled_from=assembled_from,
             syntax_tree=syntax_tree, corrections=corrections,
-            expansions=corrections,
-            clause_index=clause_index, processing_ms=processing_ms, ts=time.time(),
-            relations=relations, triplets=triplets,
-            coreferences=coreferences, attributes=attributes,
-            events=events, quantifiers=quantifiers, negations=negations,
-            modalities=[], comparisons=comparisons, roles=roles,
-            temporal_sequences=[], subordinate_clauses=subordinate_clauses,
-            secondary_intents=secondary_intents, relative_tenses=relative_tenses,
-            scheduled_time=scheduled_time,
-            reported_speeches=reported_speeches,
-            contextual_roles=contextual_roles,
-            collective_entities=collective_entities,
-            compound_modalities=compound_modalities,
-            fixed_expression=fixed_expr,
-            entities_set=entities_set, facts=set(),
+            clause_index=clause_index, processing_ms=ms, ts=time.time(),
         )
 
     def get_metrics(self) -> dict:
         return {
             "pipeline": self._metrics.summary(),
             "temporal_cache": self._resolver.get_stats(),
-            "corrections_top": dict(sorted(self._corrections_stats.items(), key=lambda x: x[1], reverse=True)[:10]),
+            "corrections_top": dict(sorted(
+                self._corrections_stats.items(),
+                key=lambda x: x[1], reverse=True)[:10]),
         }
 
     def benchmark(self, n: int = 20) -> dict:
         samples = ["comment tu vas ?", "t'étais où hier soir ?",
                    "allume la lumière", "je jardinerai demain matin pendant 2h",
-                   "rappelle-moi d'éteindre la lumière dans 20 minutes",
-                   "Paul a dit qu'il viendrait", "rdv devant la banque à 20h"]
+                   "pendant les vacances d'été on ira à la mer"]
         times = []
         for i in range(n):
             t0 = time.time()
@@ -3241,6 +2095,10 @@ class IntentPipeline:
                 "max_ms": round(np.max(times), 1),
                 "p95_ms": round(np.percentile(times, 95), 1)}
 
+
+# ============================================================
+# SECTION 14 — EventGraph + EventGraphConsumer (COMPLET)
+# ============================================================
 
 @dataclass
 class EpisodicEntity:
@@ -3267,35 +2125,145 @@ class EpisodicEvent:
     ts: float
 
 
+@dataclass
+class GraphContext:
+    """Contexte pour le graphe d'événements."""
+    subjects: List[str] = field(default_factory=list)
+    location: Optional[str] = None
+    time_base: Optional[datetime.datetime] = None
+    time_end: Optional[datetime.datetime] = None
+
+
 class EventGraph:
+    """
+    Graphe d'événements pour la mémoire épisodique.
+    Version complète avec GraphContext.
+    """
+
     def __init__(self):
         self._lock = threading.RLock()
         self.entities: Dict[str, EpisodicEntity] = {}
         self.events: List[EpisodicEvent] = []
+        self.context = GraphContext()
         self._counter = 0
 
-    def add_event(self, action: str, agent: List[str] = None, objects: List[str] = None,
-                  concept: str = None, scope: str = "UNKNOWN", salience: float = 0.0,
-                  trigger_id: int = None, intent_type: str = "unknown", raw_text: str = "") -> EpisodicEvent:
+    def set_location(self, loc: Optional[str]):
+        """Définit la localisation courante."""
+        with self._lock:
+            if loc:
+                self.context.location = loc.lower()
+
+    def set_time(self, iso_start: Optional[str], iso_end: Optional[str] = None):
+        """Définit la temporalité courante."""
+        with self._lock:
+            if iso_start:
+                try:
+                    self.context.time_base = datetime.datetime.fromisoformat(iso_start)
+                except (ValueError, TypeError):
+                    pass
+            if iso_end:
+                try:
+                    self.context.time_end = datetime.datetime.fromisoformat(iso_end)
+                except (ValueError, TypeError):
+                    pass
+
+    def set_subjects(self, subjects: List[str]):
+        """Définit les sujets courants."""
+        with self._lock:
+            if subjects:
+                self.context.subjects = subjects
+
+    def upsert_entity(self, name: str, etype: str):
+        """Ajoute ou met à jour une entité."""
+        key = name.lower()
+        with self._lock:
+            if key in self.entities:
+                self.entities[key].count += 1
+            else:
+                self.entities[key] = EpisodicEntity(name=name, type=etype, count=1)
+
+    def add_event(
+        self,
+        action: str,
+        agent: List[str] = None,
+        objects: List[str] = None,
+        concept: str = None,
+        scope: str = "UNKNOWN",
+        salience: float = 0.0,
+        trigger_id: int = None,
+        intent_type: str = "unknown",
+        raw_text: str = "",
+    ) -> EpisodicEvent:
+        """Ajoute un événement au graphe."""
         with self._lock:
             self._counter += 1
             ev = EpisodicEvent(
-                id=self._counter, action=action, agent=agent or [],
-                objects=objects or [], location=None, concept=concept,
-                start_time=None, end_time=None, scope=scope,
-                salience=salience, trigger_id=trigger_id,
-                intent_type=intent_type, raw_text=raw_text, ts=time.time(),
+                id=self._counter,
+                action=action,
+                agent=agent or self.context.subjects or [],
+                objects=objects or [],
+                location=self.context.location,
+                concept=concept,
+                start_time=self.context.time_base,
+                end_time=self.context.time_end,
+                scope=scope,
+                salience=salience,
+                trigger_id=trigger_id,
+                intent_type=intent_type,
+                raw_text=raw_text,
+                ts=time.time(),
             )
             self.events.append(ev)
             return ev
 
-    def summary(self) -> dict:
+    def last_events(self, n: int = 5) -> List[EpisodicEvent]:
+        """Retourne les n derniers événements."""
         with self._lock:
-            return {"total_events": len(self.events), "total_entities": len(self.entities)}
+            return list(self.events[-n:])
+
+    def events_by_scope(self, scope: str) -> List[EpisodicEvent]:
+        """Retourne les événements par scope temporel."""
+        with self._lock:
+            return [e for e in self.events if e.scope == scope]
+
+    def events_by_agent(self, agent: str) -> List[EpisodicEvent]:
+        """Retourne les événements par agent."""
+        agent_lower = agent.lower()
+        with self._lock:
+            return [
+                e for e in self.events
+                if any(a.lower() == agent_lower for a in e.agent)
+            ]
+
+    def top_entities(self, n: int = 5) -> List[EpisodicEntity]:
+        """Retourne les entités les plus fréquentes."""
+        with self._lock:
+            return sorted(self.entities.values(), key=lambda e: e.count, reverse=True)[:n]
+
+    def summary(self) -> dict:
+        """Retourne un résumé du graphe."""
+        with self._lock:
+            return {
+                "total_events": len(self.events),
+                "total_entities": len(self.entities),
+                "by_scope": {
+                    scope: sum(1 for e in self.events if e.scope == scope)
+                    for scope in ("PAST", "PRESENT", "FUTURE", "HYPOTHETICAL", "UNKNOWN")
+                },
+                "top_entities": [
+                    {"name": e.name, "type": e.type, "count": e.count}
+                    for e in sorted(self.entities.values(), key=lambda x: x.count, reverse=True)[:5]
+                ],
+            }
 
 
 class EventGraphConsumer(threading.Thread):
-    EVENT_INTENTS = {"information_input", "action_device", "chit_chat", "reminder", "scheduled_action"}
+    """
+    Consomme les listes d'Intent dicts produits par IntentPipeline.
+    Chaque intent de la liste est traité indépendamment.
+    """
+
+    EVENT_INTENTS = {"information_input", "action_device", "chit_chat"}
 
     def __init__(self, q_in: Queue, graph: EventGraph):
         super().__init__(name="eventgraph-consumer", daemon=True)
@@ -3323,24 +2291,73 @@ class EventGraphConsumer(threading.Thread):
         logger.info("EventGraphConsumer arrêté.")
 
     def _consume(self, intent: dict):
+        """Consomme un intent et met à jour le graphe."""
+        self._graph.set_location(intent.get("where"))
+
+        when = intent.get("when")
+        if when:
+            self._graph.set_time(when.get("iso_start"), when.get("iso_end"))
+
+        actions = intent.get("actions") or []
+        agents = list({
+            s for a in actions for s in (a.get("subjects") or [])
+            if s.lower() not in ("je", "j'", "j", "on")
+        })
+        if any(s.lower().rstrip("'") in ("je", "j", "moi", "on", "nous")
+               for a in actions for s in (a.get("subjects") or [])):
+            agents = ["human"] + agents
+        if agents:
+            self._graph.set_subjects(agents)
+
+        for ent in (intent.get("entities") or []):
+            if ent.get("type") in ("person", "location", "organization", "event", "product"):
+                self._graph.upsert_entity(ent["raw"], ent["type"])
+
+        for p in (intent.get("with_who") or []):
+            self._graph.upsert_entity(p, "person")
+
+        if intent.get("intent") not in self.EVENT_INTENTS:
+            return
+
         verb = intent.get("verb") or {}
         scope = verb.get("scope", "UNKNOWN")
         salience = (intent.get("memory_hint") or {}).get("salience", 0.3)
         raw_text = intent.get("text", "")
-        actions = intent.get("actions") or [{"verb": intent.get("action", "unknown"),
-                                             "subjects": [], "objects": [intent.get("target")]}]
-        self._graph.add_event(
-            action=actions[0].get("verb", "unknown"),
-            agent=actions[0].get("subjects") or [],
-            objects=actions[0].get("objects") or [],
-            concept=verb.get("concept"),
-            scope=scope, salience=salience, intent_type=intent.get("intent", "unknown"), raw_text=raw_text,
-        )
 
+        if not actions:
+            self._graph.add_event(
+                action=intent.get("action") or intent.get("intent", "unknown"),
+                objects=[intent["target"]] if intent.get("target") else [],
+                scope=scope,
+                salience=salience,
+                intent_type=intent.get("intent", "unknown"),
+                raw_text=raw_text,
+            )
+            return
+
+        prev_id = None
+        for act in actions:
+            ev = self._graph.add_event(
+                action=act.get("verb", "unknown"),
+                agent=act.get("subjects") or [],
+                objects=act.get("objects") or [],
+                concept=act.get("concept"),
+                scope=scope,
+                salience=salience,
+                trigger_id=prev_id,
+                intent_type=intent.get("intent", "unknown"),
+                raw_text=raw_text,
+            )
+            prev_id = ev.id
+
+
+# ============================================================
+# SECTION 15 — Tests
+# ============================================================
 
 def run_tests():
     print("\n" + "=" * 68)
-    print("  TESTS IntentPipeline v4.2 (version finale)")
+    print("  TESTS IntentPipeline v4")
     print("=" * 68)
     passed = failed = 0
 
@@ -3353,130 +2370,278 @@ def run_tests():
         else:
             failed += 1
 
-    print("\n  [AliasExpander]")
-    text, expansions = AliasExpander.expand("rdv stp")
-    check("alias 'rdv'", "donner rendez-vous" in text)
-    check("alias 'stp'", "s'il te plaît" in text)
-
     print("\n  [FrenchTextCorrector]")
-    result, _ = FrenchTextCorrector.correct("jsp pk")
-    check("corrector 'jsp pk'", "pas" in result or "sais" in result)
+    for raw, expected_word in [("jsp pkoi", "sais"), ("ajd je suis là", "aujourd'hui")]:
+        result, _ = FrenchTextCorrector.correct(raw)
+        check(f"correct '{raw}'", expected_word in result, f"→'{result}'")
 
     print("\n  [ConversationContext]")
     ctx = ConversationContext()
     ctx.last_action = "jardiner"
+    ctx.last_intent_type = "information_input"
+    ctx.timestamp = time.time()
     check("ellipsis 'encore'", ctx.resolve_ellipsis("encore") == "refais jardiner")
+    ctx.last_location = "jardin"
+    check("pronom 'y'", "jardin" in ctx.resolve_pronouns("j'y vais demain"))
 
     print("\n  [split_clauses]")
-    parts = split_clauses("je jardinerai et je lirai")
-    check("split coordonnée", len(parts) == 2, f"obtenu {len(parts)}")
+    for text, expected in [
+        ("je jardinerai et je lirai", 2),
+        ("Marie et Paul viendront", 1),
+        ("j'ai mangé puis je suis sorti", 2),
+        ("il pleut aujourd'hui", 1),
+    ]:
+        parts = split_clauses(text)
+        check(f"split '{text[:40]}'", len(parts) == expected,
+              f"attendu={expected} obtenu={len(parts)}")
 
-    print("\n  [ScheduledTimeExtractor]")
-    scheduled = ScheduledTimeExtractor.extract("dans 20 minutes")
-    check("scheduled 'dans 20 minutes'", scheduled is not None)
-    if scheduled:
-        check("scheduled has iso", scheduled.iso is not None)
-
-    scheduled = ScheduledTimeExtractor.extract("ce soir")
-    check("scheduled 'ce soir'", scheduled is not None)
-
-    print("\n  [RelationExtractor]")
+    spacy_available = False
     try:
         import spacy
         nlp = spacy.load(SPACY_MODEL)
-        doc = nlp("le fils de Marie")
-        relations = RelationExtractor.extract(doc)
-        check("relation 'fils de Marie'", len(relations) > 0)
-
-        print("\n  [ReportedSpeechExtractor]")
-        doc = nlp("Paul a dit qu'il viendrait")
-        speeches = ReportedSpeechExtractor.extract(doc)
-        check("reported speech", len(speeches) > 0)
-
-        print("\n  [ContextualRoleExtractor]")
-        doc = nlp("En tant que président, je déclare")
-        roles = ContextualRoleExtractor.extract(doc)
-        check("contextual role", len(roles) > 0)
-
-        print("\n  [CollectiveEntityExtractor]")
-        doc = nlp("L'équipe de France")
-        collectives = CollectiveEntityExtractor.extract(doc)
-        check("collective entity", len(collectives) > 0)
-
+        spacy_available = True
     except Exception as e:
-        print(f"  ⚠️ spaCy non disponible: {e}")
+        print(f"\n  ⚠️ spaCy absent ({e}) — tests NLU ignorés")
+        print(f"\n{'=' * 68}\n  {passed} OK / {failed} ECHEC\n{'=' * 68}")
+        return
 
-    print("\n" + "=" * 68)
-    print(f"  Résultats: {passed} OK, {failed} ECHEC")
+    print("\n  [FrenchTemporalResolver]")
+    resolver = FrenchTemporalResolver()
+    ref = datetime.datetime(2025, 6, 15, 10, 0)
+    for expr, exp_type in [
+        ("ce soir", "INTERVAL"),
+        ("demain", "DATE"),
+        ("pendant les vacances d'été", "INTERVAL"),
+        ("noël", "DATE"),
+        ("lundi prochain", "DATE"),
+        ("pendant 2 heures", "DURATION"),
+    ]:
+        r = resolver.resolve(expr, ref)
+        check(f"temporal '{expr}'", r is not None, f"type={r.get('timex_type') if r else None}")
+
+    print("\n  [SEMANTIC_MAP]")
+    for verb, expected in [
+        ("manger", "INGEST"), ("créer", "CREATE"), ("donner", "TRANSFER"),
+        ("penser", "COGNITION"), ("aimer", "EMOTION"), ("dormir", "HEALTH"),
+        ("voir", "PERCEIVE"), ("aller", "MOVE"), ("être", "BE"),
+        ("dire", "COMMUNICATE"), ("jardiner", "CREATE"),
+    ]:
+        check(f"'{verb}'→{expected}", SEMANTIC_MAP.get(verb) == expected,
+              f"obtenu={SEMANTIC_MAP.get(verb)}")
+
+    print("\n  [IntentClassifier]")
+    clf = IntentClassifier()
+    for text, exp in [
+        ("allume la lumière", "action_device"),
+        ("quelle heure est-il ?", "query_state"),
+        ("bonjour", "chit_chat"),
+        ("je suis fatigué", "information_input"),
+        ("qu'as-tu fait hier ?", "query_narrative"),
+        ("que feras-tu demain ?", "query_intention"),
+    ]:
+        r = clf.classify(text)
+        check(f"classify '{text}'", r["intent"] == exp,
+              f"attendu={exp} obtenu={r['intent']}")
+
+    print("\n  [to_cognitive_frame]")
+    dummy_verb = VerbAnalysis(
+        lemma="jardiner", tense="future", scope="FUTURE", concept="CREATE",
+        person="1st_sg", number="sg", mood="indicative", polarity="positive", modal=None,
+    )
+    dummy_when = TemporalSpan(raw="demain", iso_start="2025-06-16T08:00:00",
+                              iso_end="2025-06-16T10:00:00", timex_type="DATE")
+    dummy = Intent(
+        text="je jardinerai demain matin", intent="information_input",
+        confidence=0.88, uncertain=False, scores={}, verb=dummy_verb,
+        who="1st_sg", who_raw="je", with_who=[], when=dummy_when, where="jardin",
+        what="CREATE", action=None, target=None, actions=[], entities=[],
+        memory_hint=None, register=None, assembled_from=[],
+    )
+    cf = dummy.to_cognitive_frame()
+    check("to_cognitive_frame verb", cf["verb"] == "jardiner")
+    check("to_cognitive_frame scope", cf["scope"] == "FUTURE")
+
+    print(f"\n{'=' * 68}")
+    print(f"  {passed} OK  /  {failed} ECHEC  /  {passed + failed} total")
     print("=" * 68 + "\n")
 
 
+def run_graph_tests():
+    """Test complet de l'EventGraph."""
+    print("\n" + "=" * 68)
+    print("  TESTS EventGraph v4")
+    print("=" * 68)
+    passed = failed = 0
+
+    def check(label, cond, detail=""):
+        nonlocal passed, failed
+        sym = "✅" if cond else "❌"
+        print(f"  {sym} {label}" + (f"  ({detail})" if detail else ""))
+        if cond:
+            passed += 1
+        else:
+            failed += 1
+
+    graph = EventGraph()
+    q = Queue()
+    cons = EventGraphConsumer(q, graph)
+    cons.start()
+
+    batch = [
+        {
+            "text": "je planterai des fleurs",
+            "intent": "information_input",
+            "verb": {"scope": "FUTURE"},
+            "who": "1st_sg", "who_raw": "je", "with_who": [],
+            "when": {"iso_start": "2025-06-16T08:00:00", "iso_end": "2025-06-16T10:00:00"},
+            "where": "jardin", "what": "CREATE", "action": None, "target": None,
+            "actions": [{"verb": "planter", "subjects": ["je"], "objects": ["fleurs"]}],
+            "entities": [], "memory_hint": {"subject": "human", "salience": 0.42},
+            "clause_index": 0,
+        },
+        {
+            "text": "je jardinerai ensuite",
+            "intent": "information_input",
+            "verb": {"scope": "FUTURE"},
+            "who": "1st_sg", "who_raw": "je", "with_who": [],
+            "when": None, "where": "jardin", "what": "CREATE", "action": None, "target": None,
+            "actions": [{"verb": "jardiner", "subjects": ["je"], "objects": []}],
+            "entities": [], "memory_hint": {"subject": "human", "salience": 0.38},
+            "clause_index": 1,
+        },
+    ]
+    q.put(batch)
+    q.put([{
+        "text": "allume la lumière",
+        "intent": "action_device",
+        "verb": {"scope": "PRESENT"},
+        "who": None, "who_raw": None, "with_who": [],
+        "when": None, "where": "salon",
+        "action": "turn_on", "target": "light",
+        "actions": [{"verb": "allumer", "subjects": [], "objects": ["lumière"]}],
+        "entities": [],
+        "memory_hint": None,
+        "clause_index": 0,
+    }])
+    q.put([{
+        "text": "qu'as-tu fait ?",
+        "intent": "query_narrative",
+        "verb": {"scope": "PAST"},
+        "who": "2nd_sg", "who_raw": "tu", "with_who": [],
+        "when": None, "where": None,
+        "actions": [],
+        "entities": [],
+        "memory_hint": None,
+        "clause_index": 0,
+    }])
+
+    time.sleep(0.5)
+    cons.stop()
+    cons.join(timeout=2.0)
+
+    s = graph.summary()
+    check("events >= 3", s["total_events"] >= 3, f"total={s['total_events']}")
+    check("query sans event", not any(e.intent_type == "query_narrative" for e in graph.events))
+    check("FUTURE >= 2", s["by_scope"]["FUTURE"] >= 2,
+          f"FUTURE={s['by_scope']['FUTURE']}")
+    check("action_device", any(e.intent_type == "action_device" for e in graph.events))
+    check("location jardin", any(e.location == "jardin" for e in graph.events))
+    check("time_base set", any(e.start_time is not None for e in graph.events))
+
+    print(f"\n  Résumé : {s}")
+    print("  Events:")
+    for e in graph.events[-5:]:
+        print(f"    #{e.id} [{e.scope}] {e.action}({e.agent}) "
+              f"loc={e.location} t={e.start_time} sal={e.salience:.2f}")
+
+    print(f"\n{'=' * 68}")
+    print(f"  {passed} OK  /  {failed} ECHEC  /  {passed + failed} total")
+    print("=" * 68 + "\n")
+
+
+# ============================================================
+# SECTION 16 — Point d'entrée
+# ============================================================
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="IntentPipeline v4.2 — NLU français complet")
+    parser = argparse.ArgumentParser(
+        description="IntentPipeline v4 — NLU français fusionné v3+v6")
+    parser.add_argument("--download", action="store_true", help="Télécharge CamemBERT")
+    parser.add_argument("--train", action="store_true", help="Entraîne le classificateur")
+    parser.add_argument("--data", type=str, default=str(DATA_FILE))
     parser.add_argument("--test", action="store_true", help="Exécute les tests")
+    parser.add_argument("--test-graph", action="store_true", help="Exécute les tests EventGraph")
+    parser.add_argument("--benchmark", action="store_true", help="Benchmark")
     parser.add_argument("--predict", type=str, help="Prédit une phrase")
     parser.add_argument("--interactive", action="store_true", help="Mode interactif")
     parser.add_argument("--debug", action="store_true", help="Mode debug")
     parser.add_argument("--no-corrector", action="store_true", help="Désactive le correcteur")
     args = parser.parse_args()
 
-    if args.test:
+    if args.download:
+        download_model()
+
+    elif args.train:
+        train(Path(args.data))
+
+    elif args.test:
         run_tests()
+
+    elif args.test_graph:
+        run_graph_tests()
+
+    elif args.benchmark:
+        q_in, q_out = Queue(), Queue()
+        p = IntentPipeline(q_in, q_out, debug=args.debug)
+        p.load()
+        print(json.dumps(p.benchmark(n=30), indent=2))
+        print(json.dumps(p.get_metrics(), indent=2))
 
     elif args.predict:
         q_in, q_out = Queue(), Queue()
-        pipeline = IntentPipeline(q_in, q_out, debug=args.debug)
+        p = IntentPipeline(q_in, q_out, debug=args.debug)
         if args.no_corrector:
-            pipeline.enable_corrector(False)
-        pipeline.load()
-        pipeline.start()
+            p.enable_corrector(False)
+        p.load()
+        p.start()
         q_in.put(args.predict)
         try:
             result = q_out.get(timeout=10.0)
             print(json.dumps(result, ensure_ascii=False, indent=2))
         except Empty:
             print("Timeout")
-        pipeline.stop()
+        p.stop()
 
     elif args.interactive:
-        print("Mode interactif. Tapez 'quit' pour quitter.")
+        print("Mode interactif — 'quit' pour quitter, 'metrics' pour les stats.")
         q_in, q_out = Queue(), Queue()
-        pipeline = IntentPipeline(q_in, q_out, debug=args.debug)
+        p = IntentPipeline(q_in, q_out, debug=args.debug)
         if args.no_corrector:
-            pipeline.enable_corrector(False)
-        pipeline.load()
-        pipeline.start()
+            p.enable_corrector(False)
+        p.load()
+        p.start()
 
         try:
             while True:
-                user_input = input("\n> ").strip()
-                if not user_input:
+                raw = input("\n> ").strip()
+                if not raw:
                     continue
-                if user_input.lower() in ("quit", "exit", "q"):
+                if raw.lower() in ("quit", "exit", "q"):
                     break
-                q_in.put(user_input)
+                if raw == "metrics":
+                    print(json.dumps(p.get_metrics(), indent=2, ensure_ascii=False))
+                    continue
+                q_in.put(raw)
                 try:
                     result = q_out.get(timeout=10.0)
-                    if result:
-                        intent = result[0]
-                        print(f"\nIntent: {intent['intent']} ({intent['confidence']:.2f})")
-                        if intent.get('scheduled_time'):
-                            st = intent['scheduled_time']
-                            print(f"  Programmé: {st.get('human', st.get('raw'))}")
-                        if intent.get('reported_speeches'):
-                            print(f"  Discours rapporté: {len(intent['reported_speeches'])}")
-                        if intent.get('relations'):
-                            print(f"  Relations: {len(intent['relations'])}")
-                        if intent.get('events'):
-                            print(f"  Événements: {len(intent['events'])}")
-                        if intent.get('fixed_expression'):
-                            print(f"  Expression figée: {intent['fixed_expression'].get('expression')}")
+                    for intent in result:
+                        print(json.dumps(intent, ensure_ascii=False, indent=2))
                 except Empty:
                     print("Timeout")
         except KeyboardInterrupt:
-            print("\nAu revoir!")
+            print("\nAu revoir.")
         finally:
-            pipeline.stop()
+            p.stop()
 
     else:
         parser.print_help()
