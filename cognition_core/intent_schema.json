@@ -1,0 +1,215 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Intent",
+  "description": "Structure complète d'un intent produit par IntentPipeline pour ASE",
+  "type": "object",
+  "properties": {
+    "text": {
+      "type": "string",
+      "description": "Texte original de la phrase"
+    },
+    "intent": {
+      "type": "string",
+      "enum": [
+        "query_narrative", "query_state", "query_intention",
+        "action_device", "information_input", "chit_chat",
+        "memorize", "recall"
+      ],
+      "description": "Type d'intention détectée"
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Score de confiance de la classification"
+    },
+    "uncertain": {
+      "type": "boolean",
+      "description": "Vrai si la confiance est inférieure au seuil"
+    },
+    "scores": {
+      "type": "object",
+      "description": "Scores de confiance pour chaque type d'intent"
+    },
+    "verb": {
+      "type": ["object", "null"],
+      "description": "Analyse du verbe principal",
+      "properties": {
+        "lemma": { "type": "string" },
+        "tense": { "type": "string", "enum": ["past", "present", "future", "conditional", "unknown"] },
+        "scope": { "type": "string", "enum": ["PAST", "PRESENT", "FUTURE", "HYPOTHETICAL", "UNKNOWN"] },
+        "concept": { "type": ["string", "null"], "enum": ["PERCEIVE", "COMMUNICATE", "BE", "MOVE", "INGEST", "CREATE", "TRANSFER", "COGNITION", "EMOTION", "SOCIAL_ACT", "HEALTH", null] },
+        "person": { "type": "string", "enum": ["1st_sg", "2nd_sg", "3rd_sg", "1st_pl", "2nd_pl", "3rd_pl", "unknown"] },
+        "number": { "type": "string", "enum": ["sg", "pl", "unknown"] },
+        "mood": { "type": "string", "enum": ["indicative", "subjunctive", "imperative", "conditional", "infinitive"] },
+        "polarity": { "type": "string", "enum": ["positive", "negative"] },
+        "modal": { "type": ["string", "null"], "enum": ["obligation", "possibility", "volition", "wish", null] },
+        "pronominal": { "type": "boolean" },
+        "impersonal": { "type": "boolean" },
+        "compound": { "type": "boolean" }
+      }
+    },
+    "who": {
+      "type": ["string", "null"],
+      "enum": ["1st_sg", "2nd_sg", "3rd_sg", "1st_pl", "2nd_pl", "3rd_pl", null],
+      "description": "Personne grammaticale (1st_sg = je/moi, 2nd_sg = tu/toi)"
+    },
+    "who_raw": {
+      "type": ["string", "null"],
+      "description": "Texte brut du participant détecté"
+    },
+    "with_who": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Autres participants (avec, pour, à)"
+    },
+    "when": {
+      "type": ["object", "null"],
+      "description": "Information temporelle résolue",
+      "properties": {
+        "raw": { "type": "string" },
+        "iso_start": { "type": "string", "format": "date-time" },
+        "iso_end": { "type": "string", "format": "date-time" },
+        "timex_type": { "type": "string", "enum": ["DATE", "TIME", "DURATION", "INTERVAL", "SET"] },
+        "source": { "type": "string" },
+        "duration_raw": { "type": ["string", "null"] },
+        "duration_unit": { "type": ["string", "null"] },
+        "duration_value": { "type": ["number", "null"] },
+        "until_raw": { "type": ["string", "null"] },
+        "named_event": { "type": ["object", "null"] }
+      }
+    },
+    "where": {
+      "type": ["string", "null"],
+      "description": "Lieu extrait de la phrase"
+    },
+    "what": {
+      "type": ["string", "null"],
+      "enum": ["PERCEIVE", "COMMUNICATE", "BE", "MOVE", "INGEST", "CREATE", "TRANSFER", "COGNITION", "EMOTION", "SOCIAL_ACT", "HEALTH", null],
+      "description": "Concept sémantique extrait du verbe"
+    },
+    "action": {
+      "type": ["string", "null"],
+      "description": "Action normalisée pour action_device (turn_on, turn_off, set_up, set_down)"
+    },
+    "target": {
+      "type": ["string", "null"],
+      "description": "Cible de l'action (light, tv, heating, etc.)"
+    },
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "verb": { "type": "string" },
+          "subjects": { "type": "array", "items": { "type": "string" } },
+          "objects": { "type": "array", "items": { "type": "string" } },
+          "concept": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "entities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "raw": { "type": "string" },
+          "type": { "type": "string" },
+          "value": { "type": ["number", "null"] },
+          "unit": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "memory_hint": {
+      "type": ["object", "null"],
+      "properties": {
+        "subject": { "type": "string" },
+        "salience": { "type": "number" },
+        "entities": { "type": "array" },
+        "raw_info": { "type": "string" }
+      }
+    },
+    "register": {
+      "type": ["object", "null"],
+      "properties": {
+        "style": { "type": "string", "enum": ["familier", "soutenu", "affectif", "technique", "neutre"] },
+        "confidence": { "type": "number" },
+        "markers": { "type": "array", "items": { "type": "string" } },
+        "tu_vous": { "type": "string" },
+        "negation": { "type": "string" }
+      }
+    },
+    "assembled_from": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Fragments assemblés (pour multi-phrases)"
+    },
+    "syntax_tree": {
+      "type": ["object", "null"],
+      "description": "Arbre syntaxique complet",
+      "properties": {
+        "phrase": { "type": "string" },
+        "root": { "type": ["object", "null"] },
+        "subject": { "type": ["string", "null"] },
+        "subject_role": { "type": ["string", "null"], "enum": ["user", "ase", "other", null] },
+        "object": { "type": ["string", "null"] }
+      }
+    },
+    "corrections": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": { "type": "string" },
+        "minItems": 2,
+        "maxItems": 2
+      },
+      "description": "Corrections orthographiques appliquées (original, corrigé)"
+    },
+    "clause_index": {
+      "type": "integer",
+      "description": "Index de la clause dans une phrase multi-intent"
+    },
+    "processing_ms": {
+      "type": "number",
+      "description": "Temps de traitement en millisecondes"
+    },
+    "ts": {
+      "type": "number",
+      "description": "Timestamp Unix de création de l'intent"
+    },
+    "is_memorize": {
+      "type": "boolean",
+      "description": "Vrai si c'est une demande de mémorisation brute"
+    },
+    "memorize_content": {
+      "type": ["string", "null"],
+      "description": "Contenu à mémoriser"
+    },
+    "memorize_trigger": {
+      "type": ["string", "null"],
+      "description": "Déclencheur de mémorisation (retiens, souviens-toi, etc.)"
+    },
+    "memorize_subject": {
+      "type": ["string", "null"],
+      "description": "Sujet extrait du contenu à mémoriser"
+    },
+    "is_recall": {
+      "type": "boolean",
+      "description": "Vrai si c'est une demande de rappel"
+    },
+    "recall_query": {
+      "type": ["string", "null"],
+      "description": "Requête de rappel"
+    },
+    "recall_filters": {
+      "type": ["object", "null"],
+      "description": "Filtres pour le rappel (speaker, subject, location, time)",
+      "properties": {
+        "speaker": { "type": "string" },
+        "subject": { "type": "string" },
+        "location": { "type": "string" }
+      }
+    }
+  },
+  "required": ["text", "intent", "confidence", "uncertain", "scores", "verb", "who", "who_raw", "with_who", "when", "where", "what", "action", "target", "actions", "entities", "memory_hint", "register", "assembled_from", "syntax_tree", "corrections", "clause_index", "processing_ms", "ts", "is_memorize", "memorize_content", "memorize_trigger", "memorize_subject", "is_recall", "recall_query", "recall_filters"]
+}
